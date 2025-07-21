@@ -176,6 +176,76 @@ memorymaze:
   imag_gradient: 'reinforce'
   task: 'memorymaze_9x9'
 
+vizdoom:
+  task: vizdoom_basic
+  steps: 1e6
+  action_repeat: 1
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  eval_episode_num: 10
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  time_limit: 2100
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+vizdoom_basic:
+  task: vizdoom_basic
+  steps: 5e5
+  action_repeat: 1
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  eval_episode_num: 10
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  time_limit: 300
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+vizdoom_deadly_corridor:
+  task: vizdoom_deadly_corridor
+  steps: 1e6
+  action_repeat: 1
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  eval_episode_num: 10
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  time_limit: 2100
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+vizdoom_defend_center:
+  task: vizdoom_defend_the_center
+  steps: 1e6
+  action_repeat: 1
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  eval_episode_num: 10
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  time_limit: 2100
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+vizdoom_health_gathering:
+  task: vizdoom_health_gathering
+  steps: 1e6
+  action_repeat: 1
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  eval_episode_num: 10
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  time_limit: 2100
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
 debug:
   debug: True
   pretrain: 1
