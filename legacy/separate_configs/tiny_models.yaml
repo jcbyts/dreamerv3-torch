@@ -1,0 +1,185 @@
+# Tiny Model Configurations for Fast Iteration
+# Based on the experimental guidelines for proof-of-concept testing
+
+# Tiny DreamerV3 Baseline - Flat latents with reduced capacity
+tiny_dreamerv3:
+  # Reduced model size for fast iteration (fits on 24GB GPU with 32 envs)
+  dyn_hidden: 256
+  dyn_deter: 256  # 4x smaller than default (1024 -> 256)
+  dyn_stoch: 12   # Total latent capacity: 12 * 32 = 384
+  dyn_discrete: 32
+  units: 256
+  
+  # Hierarchical disabled
+  hierarchical_mode: false
+  
+  # Reduced encoder/decoder
+  encoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 16  # Reduced from 32
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 3  # Reduced from 5
+    mlp_units: 256 # Reduced from 1024
+    symlog_inputs: True
+    
+  decoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 16  # Reduced from 32
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 3  # Reduced from 5
+    mlp_units: 256 # Reduced from 1024
+    cnn_sigmoid: False
+    image_dist: 'mse'
+    vector_dist: 'symlog_mse'
+    outscale: 1.0
+
+# Tiny hDreamer - Hierarchical with matched total capacity
+tiny_hdreamer:
+  # Same reduced model size as baseline
+  dyn_hidden: 256
+  dyn_deter: 256
+  units: 256
+  
+  # Hierarchical enabled with matched capacity
+  hierarchical_mode: true
+  dyn_stoch: 12        # Total for compatibility (not used in hierarchical)
+  dyn_discrete: 32     # Total for compatibility (not used in hierarchical)
+  
+  # Hierarchical split: 4*32 + 8*32 = 128 + 256 = 384 (same as flat 12*32=384)
+  dyn_stoch_top: 4     # Coarse level: 4 * 32 = 128 capacity
+  dyn_stoch_bottom: 8  # Fine level: 8 * 32 = 256 capacity
+  dyn_discrete_top: 32
+  dyn_discrete_bottom: 32
+  
+  # Same reduced encoder/decoder as baseline
+  encoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 16
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 3
+    mlp_units: 256
+    symlog_inputs: True
+    
+  decoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 16
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 3
+    mlp_units: 256
+    cnn_sigmoid: False
+    image_dist: 'mse'
+    vector_dist: 'symlog_mse'
+    outscale: 1.0
+
+# Medium models for scaling experiments
+medium_dreamerv3:
+  # Medium size for scaling experiments
+  dyn_hidden: 512
+  dyn_deter: 512
+  dyn_stoch: 24   # Total latent capacity: 24 * 32 = 768
+  dyn_discrete: 32
+  units: 512
+  
+  hierarchical_mode: false
+  
+  # Standard encoder/decoder
+  encoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 32
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 4
+    mlp_units: 512
+    symlog_inputs: True
+    
+  decoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 32
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 4
+    mlp_units: 512
+    cnn_sigmoid: False
+    image_dist: 'mse'
+    vector_dist: 'symlog_mse'
+    outscale: 1.0
+
+medium_hdreamer:
+  # Medium hierarchical with matched capacity
+  dyn_hidden: 512
+  dyn_deter: 512
+  units: 512
+  
+  hierarchical_mode: true
+  dyn_stoch: 24        # For compatibility
+  dyn_discrete: 32     # For compatibility
+  
+  # Hierarchical split: 8*32 + 16*32 = 256 + 512 = 768 (same as flat 24*32=768)
+  dyn_stoch_top: 8     # Coarse level: 8 * 32 = 256 capacity
+  dyn_stoch_bottom: 16 # Fine level: 16 * 32 = 512 capacity
+  dyn_discrete_top: 32
+  dyn_discrete_bottom: 32
+  
+  # Standard encoder/decoder
+  encoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 32
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 4
+    mlp_units: 512
+    symlog_inputs: True
+    
+  decoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 32
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 4
+    mlp_units: 512
+    cnn_sigmoid: False
+    image_dist: 'mse'
+    vector_dist: 'symlog_mse'
+    outscale: 1.0
+
+# Monitoring configuration for all tiny models
+tiny_monitoring:
+  # More frequent logging for tiny models
+  log_every: 5e3
+  eval_every: 5e3
+  
+  # Reduced batch size for memory efficiency
+  batch_size: 8
+  batch_length: 32
+  
+  # Faster training
+  train_ratio: 256
+  pretrain: 50

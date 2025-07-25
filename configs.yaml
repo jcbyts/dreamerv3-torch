@@ -255,6 +255,36 @@ vizdoom_health_gathering:
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
+# Tiny models for fast iteration and proof-of-concept testing
+# Matched latent capacity between flat and hierarchical models
+
+tiny_dreamerv3:
+  # Tiny DreamerV3: just smaller latent space, everything else same as vizdoom config
+  dyn_hidden: 256
+  dyn_deter: 256
+  dyn_stoch: 12   # Total latent capacity: 12 * 32 = 384
+  dyn_discrete: 32
+  hierarchical_mode: false
+
+  # VizDoom compatibility
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  envs: 4
+
+tiny_hdreamer:
+  # Tiny hDreamer: hierarchical latents with same total capacity as tiny_dreamerv3
+  dyn_hidden: 256
+  dyn_deter: 256
+  hierarchical_mode: true
+  dyn_stoch: 12        # For compatibility (not used in hierarchical)
+  dyn_discrete: 32     # For compatibility (not used in hierarchical)
+
+  # Hierarchical split: 4*32 + 8*32 = 128 + 256 = 384 (same as flat 12*32=384)
+  dyn_stoch_top: 4     # Coarse level: 4 * 32 = 128 capacity
+  dyn_stoch_bottom: 8  # Fine level: 8 * 32 = 256 capacity
+  dyn_discrete_top: 32
+  dyn_discrete_bottom: 32
+
 # hDreamer: Hierarchical DreamerV3 configuration example
 # Enables two-level categorical latents with residual posterior parameterization
 # Maintains same hyperparameters as DreamerV3 for drop-in compatibility

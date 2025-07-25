@@ -1,0 +1,221 @@
+# hDreamer Matched Configurations for Systematic Comparison
+# These configs are matched to the DreamerV3 baselines for fair comparison
+
+# Tiny hDreamer for fast iteration and proof-of-concept
+tiny_hdreamer_basic:
+  # Inherit from base configs
+  base_config: 'tiny_hdreamer'
+  scenario_config: 'vizdoom_basic'
+  
+  # Experiment-specific settings
+  experiment_name: 'tiny_hdreamer_basic'
+  seeds: [1, 2, 3, 4, 5]  # Same seeds as baseline
+  max_steps: 5e5          # Same steps as baseline
+  
+  # Hierarchical-specific monitoring
+  monitor_kl_per_level: true
+  monitor_hierarchical_gradients: true
+  monitor_mutual_information: true
+  monitor_level_utilization: true
+  monitor_reconstruction: true
+  save_checkpoints_every: 1e5
+
+tiny_hdreamer_corridor:
+  base_config: 'tiny_hdreamer'
+  scenario_config: 'vizdoom_deadly_corridor'
+  
+  experiment_name: 'tiny_hdreamer_corridor'
+  seeds: [1, 2, 3, 4, 5]
+  max_steps: 1e6
+  
+  monitor_kl_per_level: true
+  monitor_hierarchical_gradients: true
+  monitor_mutual_information: true
+  monitor_level_utilization: true
+  monitor_reconstruction: true
+  save_checkpoints_every: 2e5
+
+tiny_hdreamer_defend:
+  base_config: 'tiny_hdreamer'
+  scenario_config: 'vizdoom_defend_center'
+  
+  experiment_name: 'tiny_hdreamer_defend'
+  seeds: [1, 2, 3, 4, 5]
+  max_steps: 1e6
+  
+  monitor_kl_per_level: true
+  monitor_hierarchical_gradients: true
+  monitor_mutual_information: true
+  monitor_level_utilization: true
+  monitor_reconstruction: true
+  save_checkpoints_every: 2e5
+
+tiny_hdreamer_health:
+  base_config: 'tiny_hdreamer'
+  scenario_config: 'vizdoom_health_gathering'
+  
+  experiment_name: 'tiny_hdreamer_health'
+  seeds: [1, 2, 3, 4, 5]
+  max_steps: 1e6
+  
+  monitor_kl_per_level: true
+  monitor_hierarchical_gradients: true
+  monitor_mutual_information: true
+  monitor_level_utilization: true
+  monitor_reconstruction: true
+  save_checkpoints_every: 2e5
+
+# Medium hDreamer for scaling experiments
+medium_hdreamer_basic:
+  base_config: 'medium_hdreamer'
+  scenario_config: 'vizdoom_basic'
+  
+  experiment_name: 'medium_hdreamer_basic'
+  seeds: [1, 2, 3]  # Same as baseline
+  max_steps: 2e6    # Same as baseline
+  
+  monitor_kl_per_level: true
+  monitor_hierarchical_gradients: true
+  monitor_mutual_information: true
+  monitor_level_utilization: true
+  monitor_reconstruction: true
+  save_checkpoints_every: 5e5
+
+medium_hdreamer_corridor:
+  base_config: 'medium_hdreamer'
+  scenario_config: 'vizdoom_deadly_corridor'
+  
+  experiment_name: 'medium_hdreamer_corridor'
+  seeds: [1, 2, 3]
+  max_steps: 3e6
+  
+  monitor_kl_per_level: true
+  monitor_hierarchical_gradients: true
+  monitor_mutual_information: true
+  monitor_level_utilization: true
+  monitor_reconstruction: true
+  save_checkpoints_every: 5e5
+
+# Multi-task generalization with hierarchy
+hdreamer_multitask:
+  base_config: 'medium_hdreamer'
+  scenario_config: 'vizdoom_multitask'
+  
+  experiment_name: 'hdreamer_multitask'
+  seeds: [1, 2, 3]
+  max_steps: 5e6
+  
+  # Multi-task + hierarchical monitoring
+  monitor_per_task_performance: true
+  monitor_transfer_learning: true
+  monitor_hierarchical_transfer: true  # Unique to hDreamer
+  monitor_kl_per_level: true
+  monitor_mutual_information: true
+  save_checkpoints_every: 1e6
+
+# Sample efficiency analysis
+hdreamer_sample_efficiency:
+  base_config: 'tiny_hdreamer'
+  scenario_config: 'vizdoom_basic'
+  
+  experiment_name: 'hdreamer_sample_efficiency'
+  seeds: [1, 2, 3, 4, 5]
+  
+  # Same evaluation points as baseline
+  evaluation_steps: [1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6]
+  max_steps: 1e6
+  
+  # Hierarchical sample efficiency monitoring
+  monitor_learning_curves: true
+  monitor_sample_efficiency: true
+  monitor_hierarchical_learning_curves: true
+  save_checkpoints_every: 1e4
+
+# Factor analysis with hierarchy
+hdreamer_factor_analysis:
+  base_config: 'tiny_hdreamer'
+  scenario_config: 'vizdoom_factor_analysis'
+  
+  experiment_name: 'hdreamer_factor_analysis'
+  seeds: [1, 2, 3]
+  max_steps: 5e5
+  
+  # Enhanced hierarchical factor analysis
+  monitor_latent_representations: true
+  monitor_linear_probing: true
+  monitor_hierarchical_linear_probing: true  # Per-level probing
+  monitor_mutual_information: true
+  monitor_factor_disentanglement: true
+  monitor_ego_world_separation: true  # Key hDreamer hypothesis
+  save_latent_activations: true
+  save_hierarchical_activations: true
+  save_checkpoints_every: 1e5
+
+# Reconstruction quality with hierarchy
+hdreamer_reconstruction:
+  base_config: 'tiny_hdreamer'
+  scenario_config: 'vizdoom_basic'
+  
+  experiment_name: 'hdreamer_reconstruction'
+  seeds: [1, 2, 3, 4, 5]
+  max_steps: 5e5
+  
+  # Hierarchical reconstruction monitoring
+  monitor_pixel_mse: true
+  monitor_perceptual_loss: true
+  monitor_reconstruction_quality: true
+  monitor_hierarchical_reconstruction: true  # Per-level contributions
+  save_reconstruction_videos: true
+  save_hierarchical_reconstructions: true
+  save_checkpoints_every: 1e5
+
+# Performance comparison
+hdreamer_performance:
+  base_config: 'tiny_hdreamer'
+  scenario_config: 'vizdoom_basic'
+  
+  experiment_name: 'hdreamer_performance'
+  seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # Same seeds as baseline
+  max_steps: 1e6
+  
+  # Performance monitoring
+  monitor_episode_returns: true
+  monitor_success_rates: true
+  monitor_convergence_speed: true
+  monitor_hierarchical_performance: true
+  save_checkpoints_every: 2e5
+
+# Ablation studies specific to hDreamer
+hdreamer_ablations:
+  # Different hierarchy configurations
+  ablation_configs:
+    # Asymmetric hierarchies
+    - name: 'top_heavy'
+      dyn_stoch_top: 8
+      dyn_stoch_bottom: 4
+      description: 'More capacity in top level'
+      
+    - name: 'bottom_heavy'
+      dyn_stoch_top: 4
+      dyn_stoch_bottom: 8
+      description: 'More capacity in bottom level'
+      
+    # Different free-bit settings
+    - name: 'high_free_bits'
+      kl_free_bits_top: 2.0
+      kl_free_bits_bottom: 2.0
+      description: 'Higher free-bit thresholds'
+      
+    - name: 'asymmetric_free_bits'
+      kl_free_bits_top: 1.0
+      kl_free_bits_bottom: 2.0
+      description: 'Different free-bits per level'
+  
+  base_config: 'tiny_hdreamer'
+  scenario_config: 'vizdoom_basic'
+  seeds: [1, 2, 3]
+  max_steps: 5e5
+  
+  monitor_kl_per_level: true
+  monitor_ablation_effects: true
+  save_checkpoints_every: 1e5

@@ -1,0 +1,144 @@
+# VizDoom Scenario Configurations
+# Specific settings for different VizDoom scenarios used in experiments
+
+# Basic scenario - simple navigation and shooting
+vizdoom_basic:
+  task: 'vizdoom_basic'
+  time_limit: 2100  # 35 seconds at 60 FPS
+  action_repeat: 1
+  
+  # VizDoom specific settings
+  vizdoom_config: 'basic.cfg'
+  resolution: [64, 64]
+  depth_buffer: false
+  labels_buffer: false
+  automap_buffer: false
+  
+  # Training settings optimized for basic scenario
+  prefill: 2500
+  eval_every: 1e4
+  eval_episode_num: 10
+
+# Deadly Corridor - more complex navigation with enemies
+vizdoom_deadly_corridor:
+  task: 'vizdoom_deadly_corridor'
+  time_limit: 2100
+  action_repeat: 1
+  
+  vizdoom_config: 'deadly_corridor.cfg'
+  resolution: [64, 64]
+  depth_buffer: true   # Useful for navigation
+  labels_buffer: true  # Useful for enemy detection
+  automap_buffer: false
+  
+  # Longer training for more complex scenario
+  prefill: 5000
+  eval_every: 2e4
+  eval_episode_num: 20
+
+# Defend the Center - stationary defense with multiple enemies
+vizdoom_defend_center:
+  task: 'vizdoom_defend_the_center'
+  time_limit: 2100
+  action_repeat: 1
+  
+  vizdoom_config: 'defend_the_center.cfg'
+  resolution: [64, 64]
+  depth_buffer: false
+  labels_buffer: true  # Critical for enemy tracking
+  automap_buffer: false
+  
+  prefill: 5000
+  eval_every: 2e4
+  eval_episode_num: 20
+
+# Health Gathering - resource collection and survival
+vizdoom_health_gathering:
+  task: 'vizdoom_health_gathering'
+  time_limit: 2100
+  action_repeat: 1
+  
+  vizdoom_config: 'health_gathering.cfg'
+  resolution: [64, 64]
+  depth_buffer: true   # Useful for navigation
+  labels_buffer: true  # Useful for item detection
+  automap_buffer: false
+  
+  prefill: 5000
+  eval_every: 2e4
+  eval_episode_num: 20
+
+# Multi-task configuration for generalization experiments
+vizdoom_multitask:
+  # This will be used to train on multiple scenarios
+  tasks: ['vizdoom_basic', 'vizdoom_deadly_corridor', 'vizdoom_defend_the_center']
+  task_weights: [1.0, 1.0, 1.0]  # Equal weighting
+  
+  # Common settings
+  time_limit: 2100
+  action_repeat: 1
+  resolution: [64, 64]
+  depth_buffer: true
+  labels_buffer: true
+  automap_buffer: false
+  
+  # Extended training for multi-task
+  prefill: 10000
+  eval_every: 5e4
+  eval_episode_num: 30
+  
+  # Curriculum learning settings
+  curriculum_schedule: 'linear'  # linear, exponential, or fixed
+  curriculum_steps: 1e6
+
+# Experimental settings for factor analysis
+vizdoom_factor_analysis:
+  # Enhanced observation space for ground truth factor extraction
+  enhanced_observations: true
+  
+  # Additional buffers for analysis
+  depth_buffer: true
+  labels_buffer: true
+  automap_buffer: true
+  game_variables: true
+  
+  # Higher resolution for better factor extraction
+  resolution: [84, 84]
+  
+  # Logging settings for analysis
+  log_every: 2e3
+  save_video_every: 1e4
+  save_latents_every: 5e3
+  
+  # Analysis-specific settings
+  linear_probe_frequency: 1e4
+  mi_analysis_frequency: 2e4
+  tsne_analysis_frequency: 5e4
+
+# Fast iteration settings for debugging
+vizdoom_debug:
+  # Very small settings for quick testing
+  envs: 4
+  batch_size: 4
+  batch_length: 16
+  prefill: 100
+  eval_every: 1e3
+  eval_episode_num: 3
+  log_every: 500
+  
+  # Tiny model
+  dyn_hidden: 64
+  dyn_deter: 64
+  dyn_stoch: 4
+  dyn_discrete: 8
+  units: 64
+  
+  # Minimal encoder/decoder
+  encoder:
+    cnn_depth: 8
+    mlp_layers: 2
+    mlp_units: 64
+  decoder:
+    cnn_depth: 8
+    mlp_layers: 2
+    mlp_units: 64
