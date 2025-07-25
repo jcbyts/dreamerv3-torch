@@ -244,8 +244,9 @@ def simulate(
     if is_eval:
         # keep only last item for saving memory. this cache is used for video_pred later
         while len(cache) > 1:
-            # FIFO
-            cache.popitem(last=False)
+            # FIFO - get first key and remove it
+            first_key = next(iter(cache))
+            cache.pop(first_key)
     return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
 
 

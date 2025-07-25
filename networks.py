@@ -28,6 +28,12 @@ class RSSM(nn.Module):
         num_actions=None,
         embed=None,
         device=None,
+        # hDreamer hierarchical parameters
+        hierarchical_mode=False,
+        stoch_top=None,
+        stoch_bottom=None,
+        discrete_top=None,
+        discrete_bottom=None,
     ):
         super(RSSM, self).__init__()
         self._stoch = stoch
@@ -45,8 +51,30 @@ class RSSM(nn.Module):
         self._embed = embed
         self._device = device
 
+        # hDreamer hierarchical configuration
+        self._hierarchical_mode = hierarchical_mode
+        if hierarchical_mode:
+            self._stoch_top = stoch_top if stoch_top is not None else stoch
+            self._stoch_bottom = stoch_bottom if stoch_bottom is not None else stoch
+            self._discrete_top = discrete_top if discrete_top is not None else discrete
+            self._discrete_bottom = discrete_bottom if discrete_bottom is not None else discrete
+            # Unimix bias for hierarchical levels (99% predicted, 1% uniform)
+            import math
+            self._unimix_bias_top = math.log(0.01)
+            self._unimix_bias_bottom = math.log(0.01)
+        else:
+            # For backward compatibility, use original parameters
+            self._stoch_top = stoch
+            self._stoch_bottom = 0
+            self._discrete_top = discrete
+            self._discrete_bottom = 0
+
         inp_layers = []
-        if self._discrete:
+        if self._hierarchical_mode and self._discrete:
+            # For hierarchical mode, input includes both top and bottom latents
+            inp_dim = (self._stoch_top * self._discrete_top +
+                      self._stoch_bottom * self._discrete_bottom + num_actions)
+        elif self._discrete:
             inp_dim = self._stoch * self._discrete + num_actions
         else:
             inp_dim = self._stoch + num_actions
@@ -77,7 +105,29 @@ class RSSM(nn.Module):
         self._obs_out_layers = nn.Sequential(*obs_out_layers)
         self._obs_out_layers.apply(tools.weight_init)
 
-        if self._discrete:
+        if self._hierarchical_mode and self._discrete:
+            # Hierarchical discrete latents - separate networks for top and bottom
+            # Top level (coarse) prior and posterior
+            self._imgs_stat_layer_top = nn.Linear(self._hidden, self._stoch_top * self._discrete_top)
+            self._imgs_stat_layer_top.apply(tools.uniform_weight_init(1.0))
+            self._obs_stat_layer_top = nn.Linear(self._hidden, self._stoch_top * self._discrete_top)
+            self._obs_stat_layer_top.apply(tools.uniform_weight_init(1.0))
+
+            # Bottom level (fine) prior and posterior
+            # Prior takes [h, z_top] as input
+            self._imgs_stat_layer_bottom = nn.Linear(
+                self._hidden + self._stoch_top * self._discrete_top,
+                self._stoch_bottom * self._discrete_bottom
+            )
+            self._imgs_stat_layer_bottom.apply(tools.uniform_weight_init(1.0))
+            # Posterior delta takes [h, embed, z_top] as input
+            self._obs_stat_layer_bottom = nn.Linear(
+                self._hidden + self._stoch_top * self._discrete_top,
+                self._stoch_bottom * self._discrete_bottom
+            )
+            self._obs_stat_layer_bottom.apply(tools.uniform_weight_init(1.0))
+        elif self._discrete:
+            # Original flat discrete latents
             self._imgs_stat_layer = nn.Linear(
                 self._hidden, self._stoch * self._discrete
             )
@@ -85,6 +135,7 @@ class RSSM(nn.Module):
             self._obs_stat_layer = nn.Linear(self._hidden, self._stoch * self._discrete)
             self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
         else:
+            # Original continuous latents
             self._imgs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
             self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
             self._obs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
@@ -98,7 +149,30 @@ class RSSM(nn.Module):
 
     def initial(self, batch_size):
         deter = torch.zeros(batch_size, self._deter, device=self._device)
-        if self._discrete:
+        if self._hierarchical_mode and self._discrete:
+            # Hierarchical discrete state
+            state = dict(
+                logit_top=torch.zeros(
+                    [batch_size, self._stoch_top, self._discrete_top], device=self._device
+                ),
+                stoch_top=torch.zeros(
+                    [batch_size, self._stoch_top, self._discrete_top], device=self._device
+                ),
+                logit_bottom=torch.zeros(
+                    [batch_size, self._stoch_bottom, self._discrete_bottom], device=self._device
+                ),
+                stoch_bottom=torch.zeros(
+                    [batch_size, self._stoch_bottom, self._discrete_bottom], device=self._device
+                ),
+                # For backward compatibility, also include combined stoch
+                stoch=torch.zeros(
+                    [batch_size, self._stoch_top * self._discrete_top +
+                     self._stoch_bottom * self._discrete_bottom], device=self._device
+                ),
+                deter=deter,
+            )
+        elif self._discrete:
+            # Original flat discrete state
             state = dict(
                 logit=torch.zeros(
                     [batch_size, self._stoch, self._discrete], device=self._device
@@ -109,6 +183,7 @@ class RSSM(nn.Module):
                 deter=deter,
             )
         else:
+            # Original continuous state
             state = dict(
                 mean=torch.zeros([batch_size, self._stoch], device=self._device),
                 std=torch.zeros([batch_size, self._stoch], device=self._device),
@@ -119,10 +194,52 @@ class RSSM(nn.Module):
             return state
         elif self._initial == "learned":
             state["deter"] = torch.tanh(self.W).repeat(batch_size, 1)
-            state["stoch"] = self.get_stoch(state["deter"])
+            if self._hierarchical_mode:
+                # For hierarchical mode, get initial stoch from learned deter
+                stoch_top, stoch_bottom = self.get_stoch_hierarchical(state["deter"])
+                state["stoch_top"] = stoch_top
+                state["stoch_bottom"] = stoch_bottom
+                # Update combined stoch for compatibility
+                state["stoch"] = self._combine_stoch(stoch_top, stoch_bottom)
+            else:
+                state["stoch"] = self.get_stoch(state["deter"])
             return state
         else:
             raise NotImplementedError(self._initial)
+
+    def _combine_stoch(self, stoch_top, stoch_bottom):
+        """Combine hierarchical stoch into flat representation for compatibility."""
+        if self._discrete:
+            # Flatten and concatenate
+            shape_top = list(stoch_top.shape[:-2]) + [self._stoch_top * self._discrete_top]
+            shape_bottom = list(stoch_bottom.shape[:-2]) + [self._stoch_bottom * self._discrete_bottom]
+            stoch_top_flat = stoch_top.reshape(shape_top)
+            stoch_bottom_flat = stoch_bottom.reshape(shape_bottom)
+            return torch.cat([stoch_top_flat, stoch_bottom_flat], -1)
+        else:
+            return torch.cat([stoch_top, stoch_bottom], -1)
+
+    def get_stoch_hierarchical(self, deter):
+        """Get hierarchical stoch from deterministic state."""
+        x = self._img_out_layers(deter)
+        # Get top level
+        stats_top = self._suff_stats_layer_hierarchical("ims", x, level="top")
+        dist_top = self.get_dist_hierarchical(stats_top, level="top")
+        stoch_top = dist_top.mode()
+
+        # Get bottom level conditioned on top
+        if self._discrete:
+            stoch_top_flat = stoch_top.reshape(
+                list(stoch_top.shape[:-2]) + [self._stoch_top * self._discrete_top]
+            )
+        else:
+            stoch_top_flat = stoch_top
+        x_bottom = torch.cat([x, stoch_top_flat], -1)
+        stats_bottom = self._suff_stats_layer_hierarchical("ims", x_bottom, level="bottom")
+        dist_bottom = self.get_dist_hierarchical(stats_bottom, level="bottom")
+        stoch_bottom = dist_bottom.mode()
+
+        return stoch_top, stoch_bottom
 
     def observe(self, embed, action, is_first, state=None):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
@@ -152,14 +269,92 @@ class RSSM(nn.Module):
         return prior
 
     def get_feat(self, state):
-        stoch = state["stoch"]
+        if self._hierarchical_mode:
+            # For hierarchical mode, concatenate [h, z_top, z_bottom]
+            stoch_top = state["stoch_top"]
+            stoch_bottom = state["stoch_bottom"]
+            if self._discrete:
+                shape_top = list(stoch_top.shape[:-2]) + [self._stoch_top * self._discrete_top]
+                shape_bottom = list(stoch_bottom.shape[:-2]) + [self._stoch_bottom * self._discrete_bottom]
+                stoch_top = stoch_top.reshape(shape_top)
+                stoch_bottom = stoch_bottom.reshape(shape_bottom)
+            return torch.cat([stoch_top, stoch_bottom, state["deter"]], -1)
+        else:
+            # Original flat latent behavior
+            stoch = state["stoch"]
+            if self._discrete:
+                shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
+                stoch = stoch.reshape(shape)
+            return torch.cat([stoch, state["deter"]], -1)
+
+    def get_dist_hierarchical(self, state, level="top", dtype=None):
+        """Get distribution for hierarchical latents."""
         if self._discrete:
-            shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
-            stoch = stoch.reshape(shape)
-        return torch.cat([stoch, state["deter"]], -1)
+            logit = state["logit"]
+            if level == "top":
+                unimix_ratio = self._unimix_ratio
+            else:
+                unimix_ratio = self._unimix_ratio
+            dist = torchd.independent.Independent(
+                tools.OneHotDist(logit, unimix_ratio=unimix_ratio), 1
+            )
+        else:
+            mean, std = state["mean"], state["std"]
+            dist = tools.ContDist(
+                torchd.independent.Independent(torchd.normal.Normal(mean, std), 1)
+            )
+        return dist
+
+    def _suff_stats_layer_hierarchical(self, name, x, level="top"):
+        """Sufficient statistics layer for hierarchical latents."""
+        if self._discrete:
+            if level == "top":
+                if name == "ims":
+                    x = self._imgs_stat_layer_top(x)
+                elif name == "obs":
+                    x = self._obs_stat_layer_top(x)
+                else:
+                    raise NotImplementedError
+                logit = x.reshape(list(x.shape[:-1]) + [self._stoch_top, self._discrete_top])
+            else:  # bottom level
+                if name == "ims":
+                    x = self._imgs_stat_layer_bottom(x)
+                elif name == "obs":
+                    x = self._obs_stat_layer_bottom(x)
+                else:
+                    raise NotImplementedError
+                logit = x.reshape(list(x.shape[:-1]) + [self._stoch_bottom, self._discrete_bottom])
+            return {"logit": logit}
+        else:
+            # For continuous case, would need separate mean/std handling
+            raise NotImplementedError("Hierarchical continuous latents not implemented")
 
     def get_dist(self, state, dtype=None):
-        if self._discrete:
+        if self._hierarchical_mode and self._discrete:
+            # For hierarchical models, return combined entropy from both levels
+            # This is used for logging and compatibility
+            dist_top = self.get_dist_hierarchical({"logit": state["logit_top"]}, level="top")
+            dist_bottom = self.get_dist_hierarchical({"logit": state["logit_bottom"]}, level="bottom")
+
+            # Create a combined distribution for entropy computation
+            class CombinedDist:
+                def __init__(self, dist_top, dist_bottom):
+                    self.dist_top = dist_top
+                    self.dist_bottom = dist_bottom
+
+                def entropy(self):
+                    return self.dist_top.entropy() + self.dist_bottom.entropy()
+
+                def sample(self):
+                    # This shouldn't be used, but included for completeness
+                    return torch.cat([self.dist_top.sample(), self.dist_bottom.sample()], -1)
+
+                def mode(self):
+                    # This shouldn't be used, but included for completeness
+                    return torch.cat([self.dist_top.mode(), self.dist_bottom.mode()], -1)
+
+            return CombinedDist(dist_top, dist_bottom)
+        elif self._discrete:
             logit = state["logit"]
             dist = torchd.independent.Independent(
                 tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
@@ -196,40 +391,127 @@ class RSSM(nn.Module):
         x = torch.cat([prior["deter"], embed], -1)
         # (batch_size, prior_deter + embed) -> (batch_size, hidden)
         x = self._obs_out_layers(x)
-        # (batch_size, hidden) -> (batch_size, stoch, discrete_num)
-        stats = self._suff_stats_layer("obs", x)
-        if sample:
-            stoch = self.get_dist(stats).sample()
+
+        if self._hierarchical_mode and self._discrete:
+            # Hierarchical posterior computation
+            # Top level posterior
+            stats_top = self._suff_stats_layer_hierarchical("obs", x, level="top")
+            # Add unimix bias
+            stats_top["logit"] = stats_top["logit"] + self._unimix_bias_top
+            if sample:
+                stoch_top = self.get_dist_hierarchical(stats_top, level="top").sample()
+            else:
+                stoch_top = self.get_dist_hierarchical(stats_top, level="top").mode()
+
+            # Bottom level posterior (residual)
+            stoch_top_flat = stoch_top.reshape(
+                list(stoch_top.shape[:-2]) + [self._stoch_top * self._discrete_top]
+            )
+            x_bottom = torch.cat([x, stoch_top_flat], -1)
+            # Get bottom level prior logits
+            prior_logits_bottom = prior["logit_bottom"]
+            # Get bottom level posterior delta
+            stats_bottom_delta = self._suff_stats_layer_hierarchical("obs", x_bottom, level="bottom")
+            # Residual posterior: prior + delta
+            stats_bottom = {"logit": prior_logits_bottom + stats_bottom_delta["logit"]}
+            if sample:
+                stoch_bottom = self.get_dist_hierarchical(stats_bottom, level="bottom").sample()
+            else:
+                stoch_bottom = self.get_dist_hierarchical(stats_bottom, level="bottom").mode()
+
+            # Combine for compatibility
+            stoch_combined = self._combine_stoch(stoch_top, stoch_bottom)
+
+            post = {
+                "stoch_top": stoch_top,
+                "stoch_bottom": stoch_bottom,
+                "stoch": stoch_combined,  # for compatibility
+                "deter": prior["deter"],
+                "logit_top": stats_top["logit"],
+                "logit_bottom": stats_bottom["logit"]
+            }
         else:
-            stoch = self.get_dist(stats).mode()
-        post = {"stoch": stoch, "deter": prior["deter"], **stats}
+            # Original flat latent behavior
+            stats = self._suff_stats_layer("obs", x)
+            if sample:
+                stoch = self.get_dist(stats).sample()
+            else:
+                stoch = self.get_dist(stats).mode()
+            post = {"stoch": stoch, "deter": prior["deter"], **stats}
+
         return post, prior
 
     def img_step(self, prev_state, prev_action, sample=True):
-        # (batch, stoch, discrete_num)
-        prev_stoch = prev_state["stoch"]
-        if self._discrete:
-            shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
-            # (batch, stoch, discrete_num) -> (batch, stoch * discrete_num)
-            prev_stoch = prev_stoch.reshape(shape)
-        # (batch, stoch * discrete_num) -> (batch, stoch * discrete_num + action)
+        if self._hierarchical_mode and self._discrete:
+            # Hierarchical prior computation
+            # Use hierarchical stoch for input
+            prev_stoch_top = prev_state["stoch_top"]
+            prev_stoch_bottom = prev_state["stoch_bottom"]
+
+            # Flatten hierarchical stoch
+            shape_top = list(prev_stoch_top.shape[:-2]) + [self._stoch_top * self._discrete_top]
+            shape_bottom = list(prev_stoch_bottom.shape[:-2]) + [self._stoch_bottom * self._discrete_bottom]
+            prev_stoch_top_flat = prev_stoch_top.reshape(shape_top)
+            prev_stoch_bottom_flat = prev_stoch_bottom.reshape(shape_bottom)
+            prev_stoch = torch.cat([prev_stoch_top_flat, prev_stoch_bottom_flat], -1)
+        else:
+            # Original flat latent behavior
+            prev_stoch = prev_state["stoch"]
+            if self._discrete:
+                shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
+                prev_stoch = prev_stoch.reshape(shape)
+
+        # Common recurrent computation
         x = torch.cat([prev_stoch, prev_action], -1)
-        # (batch, stoch * discrete_num + action, embed) -> (batch, hidden)
         x = self._img_in_layers(x)
-        for _ in range(self._rec_depth):  # rec depth is not correctly implemented
+        for _ in range(self._rec_depth):
             deter = prev_state["deter"]
-            # (batch, hidden), (batch, deter) -> (batch, deter), (batch, deter)
             x, deter = self._cell(x, [deter])
             deter = deter[0]  # Keras wraps the state in a list.
-        # (batch, deter) -> (batch, hidden)
         x = self._img_out_layers(x)
-        # (batch, hidden) -> (batch_size, stoch, discrete_num)
-        stats = self._suff_stats_layer("ims", x)
-        if sample:
-            stoch = self.get_dist(stats).sample()
+
+        if self._hierarchical_mode and self._discrete:
+            # Hierarchical prior generation
+            # Top level prior
+            stats_top = self._suff_stats_layer_hierarchical("ims", x, level="top")
+            stats_top["logit"] = stats_top["logit"] + self._unimix_bias_top
+            if sample:
+                stoch_top = self.get_dist_hierarchical(stats_top, level="top").sample()
+            else:
+                stoch_top = self.get_dist_hierarchical(stats_top, level="top").mode()
+
+            # Bottom level prior conditioned on top
+            stoch_top_flat = stoch_top.reshape(
+                list(stoch_top.shape[:-2]) + [self._stoch_top * self._discrete_top]
+            )
+            x_bottom = torch.cat([x, stoch_top_flat], -1)
+            stats_bottom = self._suff_stats_layer_hierarchical("ims", x_bottom, level="bottom")
+            stats_bottom["logit"] = stats_bottom["logit"] + self._unimix_bias_bottom
+            if sample:
+                stoch_bottom = self.get_dist_hierarchical(stats_bottom, level="bottom").sample()
+            else:
+                stoch_bottom = self.get_dist_hierarchical(stats_bottom, level="bottom").mode()
+
+            # Combine for compatibility
+            stoch_combined = self._combine_stoch(stoch_top, stoch_bottom)
+
+            prior = {
+                "stoch_top": stoch_top,
+                "stoch_bottom": stoch_bottom,
+                "stoch": stoch_combined,  # for compatibility
+                "deter": deter,
+                "logit_top": stats_top["logit"],
+                "logit_bottom": stats_bottom["logit"]
+            }
         else:
-            stoch = self.get_dist(stats).mode()
-        prior = {"stoch": stoch, "deter": deter, **stats}
+            # Original flat latent behavior
+            stats = self._suff_stats_layer("ims", x)
+            if sample:
+                stoch = self.get_dist(stats).sample()
+            else:
+                stoch = self.get_dist(stats).mode()
+            prior = {"stoch": stoch, "deter": deter, **stats}
+
         return prior
 
     def get_stoch(self, deter):
@@ -271,23 +553,122 @@ class RSSM(nn.Module):
 
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         kld = torchd.kl.kl_divergence
-        dist = lambda x: self.get_dist(x)
-        sg = lambda x: {k: v.detach() for k, v in x.items()}
 
-        rep_loss = value = kld(
-            dist(post) if self._discrete else dist(post)._dist,
-            dist(sg(prior)) if self._discrete else dist(sg(prior))._dist,
-        )
-        dyn_loss = kld(
-            dist(sg(post)) if self._discrete else dist(sg(post))._dist,
-            dist(prior) if self._discrete else dist(prior)._dist,
-        )
-        # this is implemented using maximum at the original repo as the gradients are not backpropagated for the out of limits.
-        rep_loss = torch.clip(rep_loss, min=free)
-        dyn_loss = torch.clip(dyn_loss, min=free)
-        loss = dyn_scale * dyn_loss + rep_scale * rep_loss
+        if self._hierarchical_mode and self._discrete:
+            # Hierarchical KL computation - separate for top and bottom levels
+            dist_top = lambda x: self.get_dist_hierarchical(x, level="top")
+            dist_bottom = lambda x: self.get_dist_hierarchical(x, level="bottom")
+            sg = lambda x: {k: v.detach() for k, v in x.items()}
 
-        return loss, value, dyn_loss, rep_loss
+            # Extract hierarchical states
+            post_top = {"logit": post["logit_top"]}
+            prior_top = {"logit": prior["logit_top"]}
+            post_bottom = {"logit": post["logit_bottom"]}
+            prior_bottom = {"logit": prior["logit_bottom"]}
+
+            # Top level KL divergences
+            rep_loss_top = kld(
+                dist_top(post_top),
+                dist_top(sg(prior_top)),
+            )
+            dyn_loss_top = kld(
+                dist_top(sg(post_top)),
+                dist_top(prior_top),
+            )
+
+            # Bottom level KL divergences
+            rep_loss_bottom = kld(
+                dist_bottom(post_bottom),
+                dist_bottom(sg(prior_bottom)),
+            )
+            dyn_loss_bottom = kld(
+                dist_bottom(sg(post_bottom)),
+                dist_bottom(prior_bottom),
+            )
+
+            # Apply free-bit clipping per level
+            rep_loss_top = torch.clip(rep_loss_top, min=free)
+            dyn_loss_top = torch.clip(dyn_loss_top, min=free)
+            rep_loss_bottom = torch.clip(rep_loss_bottom, min=free)
+            dyn_loss_bottom = torch.clip(dyn_loss_bottom, min=free)
+
+            # Combine losses (sum across levels)
+            rep_loss = rep_loss_top + rep_loss_bottom
+            dyn_loss = dyn_loss_top + dyn_loss_bottom
+            value = rep_loss  # for logging
+
+            loss = dyn_scale * dyn_loss + rep_scale * rep_loss
+
+            return loss, value, dyn_loss, rep_loss
+        else:
+            # Original flat latent KL computation
+            dist = lambda x: self.get_dist(x)
+            sg = lambda x: {k: v.detach() for k, v in x.items()}
+
+            rep_loss = value = kld(
+                dist(post) if self._discrete else dist(post)._dist,
+                dist(sg(prior)) if self._discrete else dist(sg(prior))._dist,
+            )
+            dyn_loss = kld(
+                dist(sg(post)) if self._discrete else dist(sg(post))._dist,
+                dist(prior) if self._discrete else dist(prior)._dist,
+            )
+            # this is implemented using maximum at the original repo as the gradients are not backpropagated for the out of limits.
+            rep_loss = torch.clip(rep_loss, min=free)
+            dyn_loss = torch.clip(dyn_loss, min=free)
+            loss = dyn_scale * dyn_loss + rep_scale * rep_loss
+
+            return loss, value, dyn_loss, rep_loss
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Custom state dict loading with backward compatibility for flat->hierarchical models."""
+        if not self._hierarchical_mode:
+            # For flat models, use standard loading
+            return super().load_state_dict(state_dict, strict=strict)
+
+        # For hierarchical models, check if loading from flat checkpoint
+        current_keys = set(self.state_dict().keys())
+        checkpoint_keys = set(state_dict.keys())
+
+        # Check if this is a flat checkpoint (missing hierarchical keys)
+        hierarchical_keys = {
+            '_imgs_stat_layer_top.weight', '_imgs_stat_layer_top.bias',
+            '_obs_stat_layer_top.weight', '_obs_stat_layer_top.bias',
+            '_imgs_stat_layer_bottom.weight', '_obs_stat_layer_bottom.bias'
+        }
+
+        is_flat_checkpoint = not any(key in checkpoint_keys for key in hierarchical_keys)
+
+        if is_flat_checkpoint:
+            print("Loading flat DreamerV3 checkpoint into hierarchical hDreamer model...")
+            print("Note: This is experimental - hierarchical models may have different input dimensions")
+            # For now, just load compatible parameters and initialize others randomly
+            new_state_dict = {}
+
+            for key, value in state_dict.items():
+                if key.startswith('_imgs_stat_layer') or key.startswith('_obs_stat_layer'):
+                    # Skip flat stat layers - they have different dimensions
+                    print(f"Skipping incompatible layer: {key}")
+                    continue
+                elif key.startswith('_img_in_layers'):
+                    # Skip input layers - they have different input dimensions
+                    print(f"Skipping incompatible input layer: {key}")
+                    continue
+                else:
+                    # Copy compatible parameters (cell, output layers, etc.)
+                    if key in self.state_dict():
+                        if value.shape == self.state_dict()[key].shape:
+                            new_state_dict[key] = value
+                        else:
+                            print(f"Shape mismatch for {key}: {value.shape} vs {self.state_dict()[key].shape}")
+                    else:
+                        print(f"Key not found in hierarchical model: {key}")
+
+            # Load the mapped state dict
+            return super().load_state_dict(new_state_dict, strict=False)
+        else:
+            # Loading hierarchical checkpoint into hierarchical model
+            return super().load_state_dict(state_dict, strict=strict)
 
 
 class MultiEncoder(nn.Module):

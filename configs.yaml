@@ -38,6 +38,15 @@ defaults:
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
+
+  # Hierarchical DreamerV3 (hDreamer) - set hierarchical_mode: true to enable
+  hierarchical_mode: false
+  dyn_stoch_top: 16      # coarse latent dimension (when hierarchical_mode: true)
+  dyn_stoch_bottom: 16   # fine latent dimension (when hierarchical_mode: true)
+  dyn_discrete_top: 32   # coarse discrete classes (when hierarchical_mode: true)
+  dyn_discrete_bottom: 32 # fine discrete classes (when hierarchical_mode: true)
+  # Note: total capacity = stoch_top*discrete_top + stoch_bottom*discrete_bottom
+  # Default: 16*32 + 16*32 = 1024 (same as flat 32*32 = 1024)
   grad_heads: ['decoder', 'reward', 'cont']
   units: 512
   act: 'SiLU'
@@ -245,6 +254,18 @@ vizdoom_health_gathering:
   time_limit: 2100
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+# hDreamer: Hierarchical DreamerV3 configuration example
+# Enables two-level categorical latents with residual posterior parameterization
+# Maintains same hyperparameters as DreamerV3 for drop-in compatibility
+hdreamer:
+  hierarchical_mode: true
+  dyn_stoch_top: 16      # coarse latent dimension
+  dyn_stoch_bottom: 16   # fine latent dimension
+  dyn_discrete_top: 32   # coarse discrete classes
+  dyn_discrete_bottom: 32 # fine discrete classes
+  # Total capacity: 16*32 + 16*32 = 1024 (same as flat 32*32 = 1024)
+  # All other parameters inherit from defaults above
 
 debug:
   debug: True

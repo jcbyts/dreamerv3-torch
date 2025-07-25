@@ -35,6 +35,13 @@ class WorldModel(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
+        # Extract hierarchical parameters with defaults for backward compatibility
+        hierarchical_mode = getattr(config, 'hierarchical_mode', False)
+        stoch_top = getattr(config, 'dyn_stoch_top', config.dyn_stoch)
+        stoch_bottom = getattr(config, 'dyn_stoch_bottom', config.dyn_stoch)
+        discrete_top = getattr(config, 'dyn_discrete_top', config.dyn_discrete)
+        discrete_bottom = getattr(config, 'dyn_discrete_bottom', config.dyn_discrete)
+
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
             config.dyn_deter,
@@ -51,11 +58,25 @@ class WorldModel(nn.Module):
             config.num_actions,
             self.embed_size,
             config.device,
+            # hDreamer hierarchical parameters
+            hierarchical_mode=hierarchical_mode,
+            stoch_top=stoch_top,
+            stoch_bottom=stoch_bottom,
+            discrete_top=discrete_top,
+            discrete_bottom=discrete_bottom,
         )
         self.heads = nn.ModuleDict()
-        if config.dyn_discrete:
+        # Calculate feature size based on hierarchical mode
+        if hierarchical_mode and config.dyn_discrete:
+            # For hierarchical mode: [z_top_flat, z_bottom_flat, h]
+            feat_size = (stoch_top * discrete_top +
+                        stoch_bottom * discrete_bottom +
+                        config.dyn_deter)
+        elif config.dyn_discrete:
+            # Original flat discrete: [z_flat, h]
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
+            # Original continuous: [z, h]
             feat_size = config.dyn_stoch + config.dyn_deter
         self.heads["decoder"] = networks.MultiDecoder(
             feat_size, shapes, **config.decoder
@@ -218,9 +239,23 @@ class ImagBehavior(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         self._world_model = world_model
-        if config.dyn_discrete:
+
+        # Calculate feature size based on hierarchical mode (same as WorldModel)
+        hierarchical_mode = getattr(config, 'hierarchical_mode', False)
+        if hierarchical_mode and config.dyn_discrete:
+            stoch_top = getattr(config, 'dyn_stoch_top', config.dyn_stoch)
+            stoch_bottom = getattr(config, 'dyn_stoch_bottom', config.dyn_stoch)
+            discrete_top = getattr(config, 'dyn_discrete_top', config.dyn_discrete)
+            discrete_bottom = getattr(config, 'dyn_discrete_bottom', config.dyn_discrete)
+            # For hierarchical mode: [z_top_flat, z_bottom_flat, h]
+            feat_size = (stoch_top * discrete_top +
+                        stoch_bottom * discrete_bottom +
+                        config.dyn_deter)
+        elif config.dyn_discrete:
+            # Original flat discrete: [z_flat, h]
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
+            # Original continuous: [z, h]
             feat_size = config.dyn_stoch + config.dyn_deter
         self.actor = networks.MLP(
             feat_size,
