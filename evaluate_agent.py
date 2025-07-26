@@ -7,7 +7,7 @@ Visualizes agent behavior, world model predictions, and performance metrics
 import argparse
 import pathlib
 import sys
-import yaml
+import ruamel.yaml as yaml
 import torch
 import numpy as np
 import functools

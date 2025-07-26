@@ -134,8 +134,20 @@ class ViZDoom(gym.Env):
             return np.zeros(self._size + (3,), dtype=np.uint8)
 
         state = self.game.get_state()
+        if state is None:
+            # Game state is None, return zeros
+            return np.zeros(self._size + (3,), dtype=np.uint8)
+
         # VizDoom screen_buffer is already in HWC format (height, width, channels)
         image = state.screen_buffer  # No transpose needed!
+
+        if image is None:
+            # Screen buffer is None, return zeros
+            return np.zeros(self._size + (3,), dtype=np.uint8)
+
+        # Convert to numpy array if it isn't already
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
 
         # Resize image if necessary
         if image.shape[:2] != self._size:

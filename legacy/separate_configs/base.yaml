@@ -45,6 +45,10 @@ defaults:
   dyn_stoch_bottom: 16
   dyn_discrete_top: 32
   dyn_discrete_bottom: 32
+
+  # KL annealing parameters for hierarchical mode
+  kl_free_bits_max: 1.0
+  kl_anneal_steps: 50000
   
   # Architecture
   units: 512

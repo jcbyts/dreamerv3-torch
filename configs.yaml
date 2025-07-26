@@ -7,11 +7,11 @@ defaults:
   offline_evaldir: ''
   seed: 0
   deterministic_run: False
-  steps: 1e6
+  steps: 1000000
   parallel: False
-  eval_every: 1e4
+  eval_every: 10000
   eval_episode_num: 10
-  log_every: 1e4
+  log_every: 10000
   reset_every: 0
   device: 'cuda:0'
   compile: True
@@ -47,6 +47,18 @@ defaults:
   dyn_discrete_bottom: 32 # fine discrete classes (when hierarchical_mode: true)
   # Note: total capacity = stoch_top*discrete_top + stoch_bottom*discrete_bottom
   # Default: 16*32 + 16*32 = 1024 (same as flat 32*32 = 1024)
+
+  # KL annealing parameters for hierarchical mode
+  kl_free_bits_max: 1.0  # Maximum free bits value for annealing
+  kl_anneal_steps: 50000 # Number of steps over which to anneal free bits
+
+  # Linear probing evaluation parameters
+  linear_probe_every: 20000  # Steps between linear probing evaluations
+  linear_probe_episodes_train: 6  # Episodes for training linear probes
+  linear_probe_episodes_test: 4   # Episodes for testing linear probes
+  linear_probe_max_steps: 300     # Max steps per episode for probing
+  linear_probe_log_per_factor: false  # Log per-factor R² scores
+
   grad_heads: ['decoder', 'reward', 'cont']
   units: 512
   act: 'SiLU'
@@ -187,7 +199,7 @@ memorymaze:
 
 vizdoom:
   task: vizdoom_basic
-  steps: 1e6
+  steps: 1000000
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -284,6 +296,28 @@ tiny_hdreamer:
   dyn_stoch_bottom: 8  # Fine level: 8 * 32 = 256 capacity
   dyn_discrete_top: 32
   dyn_discrete_bottom: 32
+
+  # Decoder config for LadderDecoder
+  decoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: true
+    cnn_depth: 32
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 5
+    mlp_units: 1024
+    cnn_sigmoid: false
+    image_dist: 'mse'
+    vector_dist: 'symlog_mse'
+    outscale: 1.0
+    # Hierarchical parameters for LadderDecoder
+    stoch_top: 4
+    stoch_bottom: 8
+    discrete_top: 32
+    discrete_bottom: 32
+    deter_size: 256
 
 # hDreamer: Hierarchical DreamerV3 configuration example
 # Enables two-level categorical latents with residual posterior parameterization

@@ -21,6 +21,18 @@ import torch
 from torch import nn
 from torch import distributions as torchd
 
+# Linear probing evaluation - use lazy import to avoid circular dependencies
+LINEAR_PROBE_AVAILABLE = True  # Assume available, check on first use
+
+def _get_linear_probe_function():
+    """Lazy import of linear probing to avoid circular dependencies."""
+    try:
+        from eval_ego_linear_probe import run_ego_probe
+        return run_ego_probe
+    except ImportError as e:
+        print(f"Warning: Linear probing evaluation not available. Error: {e}")
+        return None
+
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -36,6 +48,11 @@ class Dreamer(nn.Module):
         self._should_pretrain = tools.Once()
         self._should_reset = tools.Every(config.reset_every)
         self._should_expl = tools.Until(int(config.expl_until / config.action_repeat))
+
+        # Linear probing evaluation scheduling
+        linear_probe_every = getattr(config, 'linear_probe_every', 20000)
+        self._should_linear_probe = tools.Every(linear_probe_every)
+
         self._metrics = {}
         # this is update step
         self._step = logger.step // config.action_repeat
@@ -74,6 +91,51 @@ class Dreamer(nn.Module):
                 if self._config.video_pred_log:
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
+
+                # Run linear probing evaluation if enabled and scheduled
+                if (self._should_linear_probe(step) and
+                    step > 0 and
+                    hasattr(self._config, 'task') and
+                    'vizdoom' in self._config.task):
+
+                    # Get linear probing function (lazy import)
+                    run_ego_probe = _get_linear_probe_function()
+
+                    if run_ego_probe is not None:
+                        try:
+                            print(f"Running ego motion linear probing at step {step}...")
+
+                            # Get linear probing parameters from config
+                            episodes_train = getattr(self._config, 'linear_probe_episodes_train', 6)
+                            episodes_test = getattr(self._config, 'linear_probe_episodes_test', 4)
+                            max_steps = getattr(self._config, 'linear_probe_max_steps', 300)
+                            log_per_factor = getattr(self._config, 'linear_probe_log_per_factor', False)
+
+                            # Run linear probing evaluation
+                            results = run_ego_probe(
+                                model_path=self._logger.logdir,
+                                config_name=self._config.task,
+                                step=step,
+                                writer=self._logger._writer,  # Use existing tensorboard writer
+                                device=self._config.device,
+                                episodes_train=episodes_train,
+                                episodes_test=episodes_test,
+                                max_steps_per_episode=max_steps,
+                                log_per_factor=log_per_factor
+                            )
+
+                            # Log summary to console
+                            model_type = "Hierarchical" if results['hierarchical'] else "Flat"
+                            print(f"Linear probing complete ({model_type} model):")
+                            for scope_name, scope_results in results["scopes"].items():
+                                macro_r2 = scope_results["macro_r2"]
+                                print(f"  {scope_name.capitalize()}: Macro R² = {macro_r2:.3f}")
+
+                        except Exception as e:
+                            print(f"Warning: Linear probing failed at step {step}: {e}")
+                    else:
+                        print(f"Warning: Linear probing skipped at step {step} - not available")
+
                 self._logger.write(fps=True)
 
         policy_output, state = self._policy(obs, state, training)

@@ -72,15 +72,28 @@ class WorldModel(nn.Module):
             feat_size = (stoch_top * discrete_top +
                         stoch_bottom * discrete_bottom +
                         config.dyn_deter)
+            # Use LadderDecoder for hierarchical mode
+            self.heads["decoder"] = networks.LadderDecoder(
+                feat_size, shapes,
+                stoch_top=stoch_top,
+                stoch_bottom=stoch_bottom,
+                discrete_top=discrete_top,
+                discrete_bottom=discrete_bottom,
+                deter_size=config.dyn_deter,
+                **config.decoder
+            )
         elif config.dyn_discrete:
             # Original flat discrete: [z_flat, h]
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            self.heads["decoder"] = networks.MultiDecoder(
+                feat_size, shapes, **config.decoder
+            )
         else:
             # Original continuous: [z, h]
             feat_size = config.dyn_stoch + config.dyn_deter
-        self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder
-        )
+            self.heads["decoder"] = networks.MultiDecoder(
+                feat_size, shapes, **config.decoder
+            )
         self.heads["reward"] = networks.MLP(
             feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
@@ -142,8 +155,12 @@ class WorldModel(nn.Module):
                 kl_free = self._config.kl_free
                 dyn_scale = self._config.dyn_scale
                 rep_scale = self._config.rep_scale
-                kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
-                    post, prior, kl_free, dyn_scale, rep_scale
+                # Get annealing parameters from config with defaults
+                free_bits_max = getattr(self._config, 'kl_free_bits_max', 1.0)
+                anneal_steps = getattr(self._config, 'kl_anneal_steps', 50000)
+                kl_loss, kl_value, dyn_loss, rep_loss, kl_info = self.dynamics.kl_loss(
+                    post, prior, kl_free, dyn_scale, rep_scale,
+                    step=self._step, free_bits_max=free_bits_max, anneal_steps=anneal_steps
                 )
                 assert kl_loss.shape == embed.shape[:2], kl_loss.shape
                 preds = {}
@@ -175,6 +192,14 @@ class WorldModel(nn.Module):
         metrics["dyn_loss"] = to_np(dyn_loss)
         metrics["rep_loss"] = to_np(rep_loss)
         metrics["kl"] = to_np(torch.mean(kl_value))
+
+        # Add hierarchical KL logging if available
+        if kl_info:
+            for key, value in kl_info.items():
+                if torch.is_tensor(value):
+                    metrics[f"kl_{key}"] = to_np(torch.mean(value))
+                else:
+                    metrics[f"kl_{key}"] = value
         with torch.cuda.amp.autocast(self._use_amp):
             metrics["prior_ent"] = to_np(
                 torch.mean(self.dynamics.get_dist(prior).entropy())

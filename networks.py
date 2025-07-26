@@ -58,10 +58,6 @@ class RSSM(nn.Module):
             self._stoch_bottom = stoch_bottom if stoch_bottom is not None else stoch
             self._discrete_top = discrete_top if discrete_top is not None else discrete
             self._discrete_bottom = discrete_bottom if discrete_bottom is not None else discrete
-            # Unimix bias for hierarchical levels (99% predicted, 1% uniform)
-            import math
-            self._unimix_bias_top = math.log(0.01)
-            self._unimix_bias_bottom = math.log(0.01)
         else:
             # For backward compatibility, use original parameters
             self._stoch_top = stoch
@@ -70,10 +66,14 @@ class RSSM(nn.Module):
             self._discrete_bottom = 0
 
         inp_layers = []
-        if self._hierarchical_mode and self._discrete:
-            # For hierarchical mode, input includes both top and bottom latents
-            inp_dim = (self._stoch_top * self._discrete_top +
-                      self._stoch_bottom * self._discrete_bottom + num_actions)
+        if self._hierarchical_mode:
+            if self._discrete:
+                # For hierarchical discrete mode, input includes both top and bottom latents
+                inp_dim = (self._stoch_top * self._discrete_top +
+                          self._stoch_bottom * self._discrete_bottom + num_actions)
+            else:
+                # For hierarchical continuous mode, input includes both top and bottom latents
+                inp_dim = self._stoch_top + self._stoch_bottom + num_actions
         elif self._discrete:
             inp_dim = self._stoch * self._discrete + num_actions
         else:
@@ -107,25 +107,26 @@ class RSSM(nn.Module):
 
         if self._hierarchical_mode and self._discrete:
             # Hierarchical discrete latents - separate networks for top and bottom
-            # Top level (coarse) prior and posterior
+            # Top level (coarse) prior and posterior with residual parameterization
             self._imgs_stat_layer_top = nn.Linear(self._hidden, self._stoch_top * self._discrete_top)
             self._imgs_stat_layer_top.apply(tools.uniform_weight_init(1.0))
-            self._obs_stat_layer_top = nn.Linear(self._hidden, self._stoch_top * self._discrete_top)
-            self._obs_stat_layer_top.apply(tools.uniform_weight_init(1.0))
+            # Top level residual posterior delta
+            self._obs_stat_layer_top_residual = nn.Linear(self._hidden, self._stoch_top * self._discrete_top)
+            self._obs_stat_layer_top_residual.apply(tools.uniform_weight_init(1.0))
 
-            # Bottom level (fine) prior and posterior
+            # Bottom level (fine) prior and posterior with residual parameterization
             # Prior takes [h, z_top] as input
             self._imgs_stat_layer_bottom = nn.Linear(
                 self._hidden + self._stoch_top * self._discrete_top,
                 self._stoch_bottom * self._discrete_bottom
             )
             self._imgs_stat_layer_bottom.apply(tools.uniform_weight_init(1.0))
-            # Posterior delta takes [h, embed, z_top] as input
-            self._obs_stat_layer_bottom = nn.Linear(
+            # Bottom level residual posterior delta takes [h, embed, z_top] as input
+            self._obs_stat_layer_bottom_residual = nn.Linear(
                 self._hidden + self._stoch_top * self._discrete_top,
                 self._stoch_bottom * self._discrete_bottom
             )
-            self._obs_stat_layer_bottom.apply(tools.uniform_weight_init(1.0))
+            self._obs_stat_layer_bottom_residual.apply(tools.uniform_weight_init(1.0))
         elif self._discrete:
             # Original flat discrete latents
             self._imgs_stat_layer = nn.Linear(
@@ -393,11 +394,14 @@ class RSSM(nn.Module):
         x = self._obs_out_layers(x)
 
         if self._hierarchical_mode and self._discrete:
-            # Hierarchical posterior computation
-            # Top level posterior
-            stats_top = self._suff_stats_layer_hierarchical("obs", x, level="top")
-            # Add unimix bias
-            stats_top["logit"] = stats_top["logit"] + self._unimix_bias_top
+            # Hierarchical posterior computation with residual parameterization
+            # Top level posterior (residual): prior + delta
+            prior_logits_top = prior["logit_top"]
+            delta_logits_top = self._obs_stat_layer_top_residual(x)
+            delta_logits_top = delta_logits_top.reshape(
+                list(delta_logits_top.shape[:-1]) + [self._stoch_top, self._discrete_top]
+            )
+            stats_top = {"logit": prior_logits_top + delta_logits_top}
             if sample:
                 stoch_top = self.get_dist_hierarchical(stats_top, level="top").sample()
             else:
@@ -411,9 +415,12 @@ class RSSM(nn.Module):
             # Get bottom level prior logits
             prior_logits_bottom = prior["logit_bottom"]
             # Get bottom level posterior delta
-            stats_bottom_delta = self._suff_stats_layer_hierarchical("obs", x_bottom, level="bottom")
+            delta_logits_bottom = self._obs_stat_layer_bottom_residual(x_bottom)
+            delta_logits_bottom = delta_logits_bottom.reshape(
+                list(delta_logits_bottom.shape[:-1]) + [self._stoch_bottom, self._discrete_bottom]
+            )
             # Residual posterior: prior + delta
-            stats_bottom = {"logit": prior_logits_bottom + stats_bottom_delta["logit"]}
+            stats_bottom = {"logit": prior_logits_bottom + delta_logits_bottom}
             if sample:
                 stoch_bottom = self.get_dist_hierarchical(stats_bottom, level="bottom").sample()
             else:
@@ -474,7 +481,6 @@ class RSSM(nn.Module):
             # Hierarchical prior generation
             # Top level prior
             stats_top = self._suff_stats_layer_hierarchical("ims", x, level="top")
-            stats_top["logit"] = stats_top["logit"] + self._unimix_bias_top
             if sample:
                 stoch_top = self.get_dist_hierarchical(stats_top, level="top").sample()
             else:
@@ -486,7 +492,6 @@ class RSSM(nn.Module):
             )
             x_bottom = torch.cat([x, stoch_top_flat], -1)
             stats_bottom = self._suff_stats_layer_hierarchical("ims", x_bottom, level="bottom")
-            stats_bottom["logit"] = stats_bottom["logit"] + self._unimix_bias_bottom
             if sample:
                 stoch_bottom = self.get_dist_hierarchical(stats_bottom, level="bottom").sample()
             else:
@@ -551,14 +556,33 @@ class RSSM(nn.Module):
             std = std + self._min_std
             return {"mean": mean, "std": std}
 
-    def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
+    def kl_loss(self, post, prior, free, dyn_scale, rep_scale, step=None,
+                free_bits_max=1.0, anneal_steps=50000):
+        """Compute KL loss with optional annealing for hierarchical models.
+
+        Args:
+            post: Posterior distribution parameters
+            prior: Prior distribution parameters
+            free: Base free bits value (used for non-hierarchical or as fallback)
+            dyn_scale: Scale for dynamics loss
+            rep_scale: Scale for representation loss
+            step: Current training step (for annealing)
+            free_bits_max: Maximum free bits value for annealing
+            anneal_steps: Number of steps over which to anneal
+        """
         kld = torchd.kl.kl_divergence
 
         if self._hierarchical_mode and self._discrete:
-            # Hierarchical KL computation - separate for top and bottom levels
+            # Hierarchical KL computation with annealing
             dist_top = lambda x: self.get_dist_hierarchical(x, level="top")
             dist_bottom = lambda x: self.get_dist_hierarchical(x, level="bottom")
             sg = lambda x: {k: v.detach() for k, v in x.items()}
+
+            # Calculate annealed free bits
+            if step is not None:
+                annealed_free_bits = free_bits_max * min(1.0, step / anneal_steps)
+            else:
+                annealed_free_bits = free  # Fallback to original free bits
 
             # Extract hierarchical states
             post_top = {"logit": post["logit_top"]}
@@ -586,20 +610,31 @@ class RSSM(nn.Module):
                 dist_bottom(prior_bottom),
             )
 
-            # Apply free-bit clipping per level
-            rep_loss_top = torch.clip(rep_loss_top, min=free)
-            dyn_loss_top = torch.clip(dyn_loss_top, min=free)
-            rep_loss_bottom = torch.clip(rep_loss_bottom, min=free)
-            dyn_loss_bottom = torch.clip(dyn_loss_bottom, min=free)
+            # Preserve unclipped value for logging (before free-bit clipping)
+            value = rep_loss_top + rep_loss_bottom
+
+            # Apply annealed free-bit clipping per level
+            rep_loss_top = torch.clip(rep_loss_top, min=annealed_free_bits)
+            dyn_loss_top = torch.clip(dyn_loss_top, min=annealed_free_bits)
+            rep_loss_bottom = torch.clip(rep_loss_bottom, min=annealed_free_bits)
+            dyn_loss_bottom = torch.clip(dyn_loss_bottom, min=annealed_free_bits)
 
             # Combine losses (sum across levels)
             rep_loss = rep_loss_top + rep_loss_bottom
             dyn_loss = dyn_loss_top + dyn_loss_bottom
-            value = rep_loss  # for logging
 
             loss = dyn_scale * dyn_loss + rep_scale * rep_loss
 
-            return loss, value, dyn_loss, rep_loss
+            # Return additional info for logging
+            return loss, value, dyn_loss, rep_loss, {
+                'annealed_free_bits': annealed_free_bits,
+                'rep_loss_top': rep_loss_top,
+                'rep_loss_bottom': rep_loss_bottom,
+                'dyn_loss_top': dyn_loss_top,
+                'dyn_loss_bottom': dyn_loss_bottom,
+                'rep_loss_top_unclipped': kld(dist_top(post_top), dist_top(sg(prior_top))),
+                'rep_loss_bottom_unclipped': kld(dist_bottom(post_bottom), dist_bottom(sg(prior_bottom))),
+            }
         else:
             # Original flat latent KL computation
             dist = lambda x: self.get_dist(x)
@@ -618,7 +653,8 @@ class RSSM(nn.Module):
             dyn_loss = torch.clip(dyn_loss, min=free)
             loss = dyn_scale * dyn_loss + rep_scale * rep_loss
 
-            return loss, value, dyn_loss, rep_loss
+            # Return same signature as hierarchical case for consistency
+            return loss, value, dyn_loss, rep_loss, {}
 
     def load_state_dict(self, state_dict, strict=True):
         """Custom state dict loading with backward compatibility for flat->hierarchical models."""
@@ -736,6 +772,162 @@ class MultiEncoder(nn.Module):
             outputs.append(self._mlp(inputs))
         outputs = torch.cat(outputs, -1)
         return outputs
+
+
+class LadderDecoder(nn.Module):
+    """Hierarchical ladder decoder for hDreamer.
+
+    Implements explicit two-stage decoder:
+    - Top latents injected into coarse decoder stage
+    - Bottom latents injected into fine decoder stage
+    """
+    def __init__(
+        self,
+        feat_size,
+        shapes,
+        mlp_keys,
+        cnn_keys,
+        act,
+        norm,
+        cnn_depth,
+        kernel_size,
+        minres,
+        mlp_layers,
+        mlp_units,
+        cnn_sigmoid,
+        image_dist,
+        vector_dist,
+        outscale,
+        # Hierarchical parameters
+        stoch_top,
+        stoch_bottom,
+        discrete_top,
+        discrete_bottom,
+        deter_size,
+    ):
+        super(LadderDecoder, self).__init__()
+        excluded = ("is_first", "is_last", "is_terminal")
+        shapes = {k: v for k, v in shapes.items() if k not in excluded}
+        self.cnn_shapes = {
+            k: v for k, v in shapes.items() if len(v) == 3 and re.match(cnn_keys, k)
+        }
+        self.mlp_shapes = {
+            k: v
+            for k, v in shapes.items()
+            if len(v) in (1, 2) and re.match(mlp_keys, k)
+        }
+        print("LadderDecoder CNN shapes:", self.cnn_shapes)
+        print("LadderDecoder MLP shapes:", self.mlp_shapes)
+
+        self._image_dist = image_dist
+        self._stoch_top = stoch_top
+        self._stoch_bottom = stoch_bottom
+        self._discrete_top = discrete_top
+        self._discrete_bottom = discrete_bottom
+        self._deter_size = deter_size
+
+        # Calculate latent dimensions
+        z_top_dim = stoch_top * discrete_top
+        z_bottom_dim = stoch_bottom * discrete_bottom
+
+        if self.cnn_shapes:
+            some_shape = list(self.cnn_shapes.values())[0]
+            shape = (sum(x[-1] for x in self.cnn_shapes.values()),) + some_shape[:-1]
+
+            # Simplified ladder approach:
+            # 1. Project [h, z_top] to coarse features
+            # 2. Project z_bottom separately
+            # 3. Combine and decode to full resolution
+
+            coarse_feat_size = deter_size + z_top_dim
+            self._coarse_proj = nn.Linear(coarse_feat_size, cnn_depth * 8)
+            self._coarse_proj.apply(tools.uniform_weight_init(outscale))
+
+            # Bottom latent projection
+            self._z_bottom_proj = nn.Linear(z_bottom_dim, cnn_depth * 8)
+            self._z_bottom_proj.apply(tools.uniform_weight_init(outscale))
+
+            # Combined decoder: takes combined features
+            combined_feat_size = cnn_depth * 8
+            self._decoder = ConvDecoder(
+                combined_feat_size,
+                shape,
+                cnn_depth,
+                act,
+                norm,
+                kernel_size,
+                minres,
+                outscale=outscale,
+                cnn_sigmoid=cnn_sigmoid,
+            )
+
+        if self.mlp_shapes:
+            # For MLP outputs, use full feature vector
+            self._mlp = MLP(
+                feat_size,
+                self.mlp_shapes,
+                mlp_layers,
+                mlp_units,
+                act,
+                norm,
+                vector_dist,
+                outscale=outscale,
+                name="LadderDecoder",
+            )
+
+    def forward(self, features):
+        """Forward pass for ladder decoder.
+
+        Args:
+            features: [z_top_flat, z_bottom_flat, h] concatenated
+        """
+        dists = {}
+
+        if self.cnn_shapes:
+            # Split features into components
+            z_top_dim = self._stoch_top * self._discrete_top
+            z_bottom_dim = self._stoch_bottom * self._discrete_bottom
+
+            z_top_flat = features[..., :z_top_dim]
+            z_bottom_flat = features[..., z_top_dim:z_top_dim + z_bottom_dim]
+            h = features[..., z_top_dim + z_bottom_dim:]
+
+            # Hierarchical feature combination:
+            # 1. Project [h, z_top] to coarse features (global/ego-motion)
+            coarse_feat = torch.cat([h, z_top_flat], -1)
+            coarse_proj = self._coarse_proj(coarse_feat)
+
+            # 2. Project z_bottom to fine features (local/object motion)
+            fine_proj = self._z_bottom_proj(z_bottom_flat)
+
+            # 3. Combine hierarchically: coarse provides base, fine adds details
+            combined_feat = coarse_proj + fine_proj
+
+            # 4. Decode combined features
+            outputs = self._decoder(combined_feat)
+
+            split_sizes = [v[-1] for v in self.cnn_shapes.values()]
+            outputs = torch.split(outputs, split_sizes, -1)
+            dists.update(
+                {
+                    key: self._make_image_dist(output)
+                    for key, output in zip(self.cnn_shapes.keys(), outputs)
+                }
+            )
+
+        if self.mlp_shapes:
+            dists.update(self._mlp(features))
+
+        return dists
+
+    def _make_image_dist(self, mean):
+        if self._image_dist == "normal":
+            return tools.ContDist(
+                torchd.independent.Independent(torchd.normal.Normal(mean, 1), 3)
+            )
+        if self._image_dist == "mse":
+            return tools.MSEDist(mean)
+        raise NotImplementedError(self._image_dist)
 
 
 class MultiDecoder(nn.Module):
