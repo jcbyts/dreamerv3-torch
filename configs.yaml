@@ -39,18 +39,42 @@ defaults:
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
 
-  # Hierarchical DreamerV3 (hDreamer) - set hierarchical_mode: true to enable
-  hierarchical_mode: false
-  dyn_stoch_top: 16      # coarse latent dimension (when hierarchical_mode: true)
-  dyn_stoch_bottom: 16   # fine latent dimension (when hierarchical_mode: true)
-  dyn_discrete_top: 32   # coarse discrete classes (when hierarchical_mode: true)
-  dyn_discrete_bottom: 32 # fine discrete classes (when hierarchical_mode: true)
-  # Note: total capacity = stoch_top*discrete_top + stoch_bottom*discrete_bottom
-  # Default: 16*32 + 16*32 = 1024 (same as flat 32*32 = 1024)
 
   # KL annealing parameters for hierarchical mode
   kl_free_bits_max: 1.0  # Maximum free bits value for annealing
   kl_anneal_steps: 50000 # Number of steps over which to anneal free bits
+
+  # CNVAE and Poisson latent configuration
+  use_cnvae: false       # Enable hierarchical CNVAE encoder/decoder
+  use_poisson: false     # Enable Poisson latent distributions in RSSM
+  poisson_temp: 1.0      # Temperature for Poisson softening (0.0 = hard, >0 = soft)
+  cnvae_cfg:             # CNVAE configuration parameters
+    scales: [64, 32, 16, 8]      # spatial resolutions for each level
+    groups: [2, 2, 2, 1]         # number of latent groups per scale
+    ch: 32                       # base channel width
+    latent_dim: 32               # latent dimension per group
+    in_channels: 3               # input image channels
+    out_channels: 3              # output image channels
+    input_sz: [64, 64]           # input image size
+    ker_sz: 3                    # kernel size
+    n_pre_blocks: 1              # number of pre-processing blocks
+    n_pre_cells: 2               # number of cells per pre-processing block
+    n_enc_cells: 2               # number of encoder cells per scale
+    n_dec_cells: 2               # number of decoder cells per scale
+    n_post_blocks: 1             # number of post-processing blocks
+    n_post_cells: 2              # number of cells per post-processing block
+    compress: true               # whether to compress latents spatially
+    activation_fn: "SiLU"        # activation function
+    use_bn: true                 # use batch normalization
+    use_se: false                # use squeeze-and-excitation blocks
+    spectral_norm: 0             # spectral normalization strength (0 = disabled)
+
+  # KL annealing and balancing parameters for CNVAE
+  kl_beta: 1.0                   # final beta value for KL annealing
+  kl_beta_min: 1e-4              # minimum beta value
+  kl_anneal_portion: 0.3         # portion of training for annealing
+  kl_const_portion: 0.0          # portion of training at minimum beta
+  kl_balancer: "equal"           # KL balancing scheme: equal, linear, sqrt, square
 
   # Linear probing evaluation parameters
   linear_probe_every: 20000  # Steps between linear probing evaluations
@@ -200,6 +224,7 @@ memorymaze:
 vizdoom:
   task: vizdoom_basic
   steps: 1000000
+  prefill: 10000
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -213,7 +238,8 @@ vizdoom:
 
 vizdoom_basic:
   task: vizdoom_basic
-  steps: 5e5
+  steps: 1000000
+  prefill: 10000
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -227,7 +253,8 @@ vizdoom_basic:
 
 vizdoom_deadly_corridor:
   task: vizdoom_deadly_corridor
-  steps: 1e6
+  steps: 1000000
+  prefill: 10000
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -241,7 +268,8 @@ vizdoom_deadly_corridor:
 
 vizdoom_defend_center:
   task: vizdoom_defend_the_center
-  steps: 1e6
+  steps: 1000000
+  prefill: 10000
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -255,7 +283,8 @@ vizdoom_defend_center:
 
 vizdoom_health_gathering:
   task: vizdoom_health_gathering
-  steps: 1e6
+  steps: 1000000
+  prefill: 10000
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -283,53 +312,10 @@ tiny_dreamerv3:
   imag_gradient: 'reinforce'
   envs: 4
 
-tiny_hdreamer:
-  # Tiny hDreamer: hierarchical latents with same total capacity as tiny_dreamerv3
-  dyn_hidden: 256
-  dyn_deter: 256
-  hierarchical_mode: true
-  dyn_stoch: 12        # For compatibility (not used in hierarchical)
-  dyn_discrete: 32     # For compatibility (not used in hierarchical)
-
-  # Hierarchical split: 4*32 + 8*32 = 128 + 256 = 384 (same as flat 12*32=384)
-  dyn_stoch_top: 4     # Coarse level: 4 * 32 = 128 capacity
-  dyn_stoch_bottom: 8  # Fine level: 8 * 32 = 256 capacity
-  dyn_discrete_top: 32
-  dyn_discrete_bottom: 32
-
-  # Decoder config for LadderDecoder
-  decoder:
-    mlp_keys: '$^'
-    cnn_keys: 'image'
-    act: 'SiLU'
-    norm: true
-    cnn_depth: 32
-    kernel_size: 4
-    minres: 4
-    mlp_layers: 5
-    mlp_units: 1024
-    cnn_sigmoid: false
-    image_dist: 'mse'
-    vector_dist: 'symlog_mse'
-    outscale: 1.0
-    # Hierarchical parameters for LadderDecoder
-    stoch_top: 4
-    stoch_bottom: 8
-    discrete_top: 32
-    discrete_bottom: 32
-    deter_size: 256
-
-# hDreamer: Hierarchical DreamerV3 configuration example
-# Enables two-level categorical latents with residual posterior parameterization
-# Maintains same hyperparameters as DreamerV3 for drop-in compatibility
-hdreamer:
-  hierarchical_mode: true
-  dyn_stoch_top: 16      # coarse latent dimension
-  dyn_stoch_bottom: 16   # fine latent dimension
-  dyn_discrete_top: 32   # coarse discrete classes
-  dyn_discrete_bottom: 32 # fine discrete classes
-  # Total capacity: 16*32 + 16*32 = 1024 (same as flat 32*32 = 1024)
-  # All other parameters inherit from defaults above
+  # Video logging
+  video_pred_log: true
+  eval_episode_num: 10
+    
 
 debug:
   debug: True
@@ -337,3 +323,100 @@ debug:
   prefill: 1
   batch_size: 10
   batch_length: 20
+
+# Model Variants
+# 1) dreamer: vanilla DreamerV3 with categorical latents and original encoder/decoder
+dreamer:
+  use_cnvae: false
+  use_poisson: false
+  use_wandb: true
+  wandb_entity: 'yateslab'
+  wandb_project: 'dreamer'
+
+# 2) pDreamer: same as dreamer but with Poisson latents in RSSM
+pdreamer:
+  use_cnvae: false
+  use_poisson: true
+  poisson_temp: 1.0
+  use_wandb: true
+  wandb_entity: 'yateslab'
+  wandb_project: 'dreamer'
+
+# 3) hiDreamer: CNVAE encoder/decoder with categorical RSSM latents
+hidreamer:
+  use_cnvae: true
+  use_poisson: false
+  cnvae_cfg:
+    scales: [64, 32, 16, 8]
+    groups: [2, 2, 2, 1]
+    ch: 32
+    latent_dim: 32
+    in_channels: 3
+    out_channels: 3
+    input_sz: [64, 64]
+    ker_sz: 3
+    n_pre_blocks: 1
+    n_pre_cells: 2
+    n_enc_cells: 2
+    n_dec_cells: 2
+    n_post_blocks: 1
+    n_post_cells: 2
+    compress: true
+    activation_fn: "SiLU"
+    use_bn: true
+    use_se: false
+    spectral_norm: 0
+    n_nodes: 1
+    act_fn: "SiLU"
+    scale: 1.0
+    eps: 0.1
+  kl_beta: 0.5
+  kl_beta_min: 1.0e-4
+  kl_anneal_portion: 0.3
+  kl_const_portion: 0.0
+  kl_balancer: "equal"
+  kl_anneal_complete_at_prefill: true
+  use_wandb: true
+  wandb_entity: 'yateslab'
+  wandb_project: 'dreamer'
+
+# 4) phiDreamer: CNVAE encoder/decoder with Poisson latents in both CNVAE and RSSM
+phidreamer:
+  logdir: './logdir/phidreamer'
+  use_cnvae: true
+  use_poisson: true
+  poisson_temp: 1.0
+  cnvae_cfg:
+    scales: [64, 32, 16, 8]
+    groups: [2, 2, 2, 1]
+    ch: 32
+    latent_dim: 32
+    in_channels: 3
+    out_channels: 3
+    input_sz: [64, 64]
+    ker_sz: 3
+    n_pre_blocks: 1
+    n_pre_cells: 2
+    n_enc_cells: 2
+    n_dec_cells: 2
+    n_post_blocks: 1
+    n_post_cells: 2
+    compress: true
+    activation_fn: "SiLU"
+    use_bn: true
+    use_se: false
+    spectral_norm: 0
+    n_nodes: 1
+    act_fn: "SiLU"
+    scale: 1.0
+    eps: 0.1
+  kl_beta: 0.5
+  kl_beta_min: 1.0e-4
+  kl_anneal_portion: 0.3
+  kl_const_portion: 0.0
+  kl_balancer: "equal"
+  kl_anneal_complete_at_prefill: true
+  use_wandb: true
+  wandb_entity: 'yateslab'
+  wandb_project: 'dreamer'
+

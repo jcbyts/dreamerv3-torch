@@ -52,6 +52,19 @@ class AgentEvaluator:
                     base[key] = value
 
         defaults = configs['defaults'].copy()
+
+        # Detect model type from logdir path and apply appropriate tiny config
+        logdir_name = str(self.logdir).lower()
+        if 'hdreamer' in logdir_name:
+            print(f"Detected hDreamer model, using tiny_hdreamer config")
+            if 'tiny_hdreamer' in configs:
+                recursive_update(defaults, configs['tiny_hdreamer'])
+        elif 'dreamerv3' in logdir_name:
+            print(f"Detected DreamerV3 model, using tiny_dreamerv3 config")
+            if 'tiny_dreamerv3' in configs:
+                recursive_update(defaults, configs['tiny_dreamerv3'])
+
+        # Apply task-specific config
         if config_name in configs:
             recursive_update(defaults, configs[config_name])
 
@@ -221,16 +234,23 @@ class AgentEvaluator:
         print(f"Creating comparison video: {output_path}")
 
         # Use first prediction sequence
-        video_data = predictions[0]  # Shape: [batch, time, height, width*3, channels]
+        video_data = predictions[0]  # Shape: [batch, time, height*3, width, channels]
 
         # Extract truth, model, and error from concatenated video
-        batch_size, time_steps, height, width_combined, channels = video_data.shape
-        width = width_combined // 3  # truth, model, error are concatenated horizontally
+        batch_size, time_steps, height_combined, width, channels = video_data.shape
 
-        # Split the concatenated video
-        truth = video_data[:, :, :, :width, :]
-        model = video_data[:, :, :, width:2*width, :]
-        error = video_data[:, :, :, 2*width:, :]
+        # The video_pred method concatenates vertically (dim=2), so height = height*3
+        height = height_combined // 3  # truth, model, error are concatenated vertically
+
+        # Split the concatenated video (vertical concatenation)
+        truth = video_data[:, :, :height, :, :]
+        model = video_data[:, :, height:2*height, :, :]
+        error = video_data[:, :, 2*height:, :, :]
+
+        # Ensure values are in [0, 1] range for proper display
+        truth = np.clip(truth, 0, 1)
+        model = np.clip(model, 0, 1)
+        error = np.clip(error, 0, 1)
 
         # Create figure for animation
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))

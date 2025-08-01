@@ -16,6 +16,13 @@ from torch.nn import functional as F
 from torch import distributions as torchd
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available. Install with: pip install wandb")
+
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -52,6 +59,157 @@ class TimeRecording:
         self._nd.record()
         torch.cuda.synchronize()
         print(self._comment, self._st.elapsed_time(self._nd) / 1000)
+
+
+class WandbLogger:
+    def __init__(self, logdir, step, entity="yateslab", project="dreamer", config=None):
+        self._logdir = logdir
+        self._last_step = None
+        self._last_time = None
+        self._scalars = {}
+        self._images = {}
+        self._videos = {}
+        self.step = step
+
+        if not WANDB_AVAILABLE:
+            raise ImportError("wandb is required for WandbLogger. Install with: pip install wandb")
+
+        # Initialize wandb
+        wandb.init(
+            entity=entity,
+            project=project,
+            dir=str(logdir),
+            config=config,
+            resume="allow",
+            id=f"run_{logdir.name}",  # Use logdir name as run ID for resuming
+        )
+
+        # Also keep tensorboard for backward compatibility if needed
+        self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
+
+    @property
+    def logdir(self):
+        """Compatibility property for accessing logdir."""
+        return self._logdir
+
+    def scalar(self, name, value):
+        self._scalars[name] = float(value)
+
+    def image(self, name, value):
+        self._images[name] = np.array(value)
+
+    def video(self, name, value):
+        self._videos[name] = np.array(value)
+
+    def write(self, fps=False, step=False):
+        if not step:
+            step = self.step
+        scalars = list(self._scalars.items())
+        if fps:
+            scalars.append(("fps", self._compute_fps(step)))
+
+        # Console output (same as before)
+        print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
+
+        # JSON logging (same as before)
+        with (self._logdir / "metrics.jsonl").open("a") as f:
+            f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
+
+        # Wandb logging - don't include step in the log dict to avoid conflicts
+        wandb_log = {}
+        for name, value in scalars:
+            wandb_log[name] = value
+
+        # Log images to wandb
+        for name, value in self._images.items():
+            # Convert to wandb Image format
+            if len(value.shape) == 3:  # H, W, C
+                wandb_log[name] = wandb.Image(value)
+            elif len(value.shape) == 4:  # B, H, W, C
+                wandb_log[name] = [wandb.Image(img) for img in value]
+
+        # Log videos to wandb
+        for name, value in self._videos.items():
+            name = name if isinstance(name, str) else name.decode("utf-8")
+
+            # Ensure video is in correct format for wandb
+            if np.issubdtype(value.dtype, np.floating):
+                # Clamp to [0, 1] range first, then convert to uint8
+                value = np.clip(value, 0.0, 1.0)
+                value = (255 * value).astype(np.uint8)
+            else:
+                # Already uint8, just clamp to valid range
+                value = np.clip(value, 0, 255).astype(np.uint8)
+
+            # Wandb expects videos in format (T, C, H, W) - time, channels, height, width
+            if len(value.shape) == 5:  # B, T, H, W, C
+                # Log each video in batch separately
+                for i, video in enumerate(value):
+                    video_name = f"{name}_{i}" if value.shape[0] > 1 else name
+                    # Convert from (T, H, W, C) to (T, C, H, W) for wandb
+                    video_wandb = video.transpose(0, 3, 1, 2)  # T, H, W, C -> T, C, H, W
+                    wandb_log[video_name] = wandb.Video(video_wandb, fps=16, format="mp4")
+            elif len(value.shape) == 4:  # T, H, W, C
+                # Convert from (T, H, W, C) to (T, C, H, W) for wandb
+                video_wandb = value.transpose(0, 3, 1, 2)  # T, H, W, C -> T, C, H, W
+                wandb_log[name] = wandb.Video(video_wandb, fps=16, format="mp4")
+
+        # Log to wandb with step parameter only
+        if wandb_log:  # Only log if there's something to log
+            wandb.log(wandb_log, step=step)
+
+        # Also log to tensorboard for backward compatibility
+        for name, value in scalars:
+            if "/" not in name:
+                self._writer.add_scalar("scalars/" + name, value, step)
+            else:
+                self._writer.add_scalar(name, value, step)
+        for name, value in self._images.items():
+            self._writer.add_image(name, value, step)
+        for name, value in self._videos.items():
+            name = name if isinstance(name, str) else name.decode("utf-8")
+            if np.issubdtype(value.dtype, np.floating):
+                value = np.clip(255 * value, 0, 255).astype(np.uint8)
+            B, T, H, W, C = value.shape
+            value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
+            self._writer.add_video(name, value, step, 16)
+
+        self._writer.flush()
+        self._scalars = {}
+        self._images = {}
+        self._videos = {}
+
+    def _compute_fps(self, step):
+        if self._last_step is None:
+            self._last_time = time.time()
+            self._last_step = step
+            return 0
+        steps = step - self._last_step
+        duration = time.time() - self._last_time
+        self._last_time += duration
+        self._last_step = step
+        return steps / duration
+
+    def offline_scalar(self, name, value, step):
+        wandb.log({name: value}, step=step)
+        self._writer.add_scalar("scalars/" + name, value, step)
+
+    def offline_video(self, name, value, step):
+        if np.issubdtype(value.dtype, np.floating):
+            value = np.clip(255 * value, 0, 255).astype(np.uint8)
+
+        # Log to wandb
+        if len(value.shape) == 5:  # B, T, H, W, C
+            for i, video in enumerate(value):
+                video_name = f"{name}_{i}" if value.shape[0] > 1 else name
+                wandb.log({video_name: wandb.Video(video, fps=16, format="mp4")}, step=step)
+        elif len(value.shape) == 4:  # T, H, W, C
+            wandb.log({name: wandb.Video(value, fps=16, format="mp4")}, step=step)
+
+        # Also log to tensorboard
+        B, T, H, W, C = value.shape
+        value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
+        self._writer.add_video(name, value, step, 16)
 
 
 class Logger:
@@ -233,7 +391,16 @@ def simulate(
 
                     score = sum(eval_scores) / len(eval_scores)
                     length = sum(eval_lengths) / len(eval_lengths)
-                    logger.video(f"eval_policy", np.array(video)[None])
+
+                    # Format video properly for logging
+                    video_array = np.array(video)
+
+                    if len(video_array.shape) == 3:  # T, H, W (grayscale)
+                        video_array = video_array[..., None]  # Add channel dimension: T, H, W, C
+                    if len(video_array.shape) == 4:  # T, H, W, C
+                        video_array = video_array[None]  # Add batch dimension: B, T, H, W, C
+
+                    logger.video(f"eval_policy", video_array)
 
                     if len(eval_scores) >= episodes and not eval_done:
                         logger.scalar(f"eval_return", score)
@@ -578,13 +745,13 @@ class ContDist:
     def mode(self):
         out = self._dist.mean
         if self.absmax is not None:
-            out *= (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
+            out = out * (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
         return out
 
     def sample(self, sample_shape=()):
         out = self._dist.rsample(sample_shape)
         if self.absmax is not None:
-            out *= (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
+            out = out * (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
         return out
 
     def log_prob(self, x):
@@ -769,8 +936,10 @@ class Optimizer:
         nontrivial = self._wd_pattern != r".*"
         if nontrivial:
             raise NotImplementedError
-        for var in varibs:
-            var.data = (1 - self._wd) * var.data
+        # Use no_grad to avoid gradient computation issues with in-place operations
+        with torch.no_grad():
+            for var in varibs:
+                var.data.mul_(1 - self._wd)
 
 
 def args_type(default):
@@ -999,3 +1168,353 @@ def recursively_load_optim_state_dict(obj, optimizers_state_dicts):
         for key in keys:
             obj_now = getattr(obj_now, key)
         obj_now.load_state_dict(state_dict)
+
+
+# Additional tools for CNVAE
+from typing import Union, Tuple, Iterable, Callable
+try:
+    from scipy.spatial.transform import Rotation
+except ImportError:
+    Rotation = None
+
+MULT = 2
+
+
+def endpoint_error(
+        y_true: torch.Tensor,
+        y_pred: torch.Tensor,
+        dim: int = 1, ):
+    epe = torch.linalg.norm(
+        y_true - y_pred, dim=dim)
+    epe = torch.sum(epe, dim=[1, 2])
+    return epe
+
+
+def endpoint_error_batch(
+        y_true: torch.Tensor,
+        y_pred: torch.Tensor,
+        batch: int = 512,
+        dim: int = 1, ):
+    delta = y_true - y_pred
+    epe = []
+    n = int(np.ceil(len(y_true) / batch))
+    for i in range(n):
+        a = i * batch
+        b = min((i+1) * batch, len(y_true))
+        epe.append(torch.linalg.norm(
+            delta[range(a, b)], dim=dim,
+        ))
+    epe = torch.cat(epe)
+    epe = torch.sum(epe, dim=[1, 2])
+    return epe
+
+
+def get_stride(cell_type: str, cmult: int):
+    startswith = cell_type.split('_')[0]
+    if startswith in ['normal', 'combiner']:
+        stride = 1
+    elif startswith == 'down':
+        stride = cmult
+    elif startswith == 'up':
+        stride = -1
+    else:
+        raise NotImplementedError(cell_type)
+    return stride
+
+
+def get_skip_connection(
+        ci: int,
+        cmult: int,
+        stride: Union[int, str],
+        reg_lognorm: bool = True, ):
+    if isinstance(stride, str):
+        stride = get_stride(stride, cmult)
+    if stride == 1:
+        return nn.Identity()
+    elif stride in [2, 4]:
+        return FactorizedReduce(
+            ci=ci,
+            co=int(cmult*ci),
+            reg_lognorm=reg_lognorm,
+        )
+    elif stride == -1:
+        return nn.Sequential(
+            nn.Upsample(
+                scale_factor=cmult,
+                mode='nearest'),
+            Conv2D(
+                kernel_size=1,
+                in_channels=ci,
+                out_channels=int(ci/cmult),
+                reg_lognorm=reg_lognorm),
+        )
+    else:
+        raise NotImplementedError(stride)
+
+
+def get_act_fn(
+        fn: str,
+        inplace: bool = False,
+        **kwargs, ):
+    if fn == 'none':
+        return None
+    elif fn == 'relu':
+        return nn.ReLU(inplace=inplace)
+    elif fn in ['swish', 'SiLU']:
+        return nn.SiLU(inplace=inplace)
+    elif fn == 'elu':
+        return nn.ELU(inplace=inplace, **kwargs)
+    elif fn == 'softplus':
+        return nn.Softplus(**kwargs)
+    else:
+        raise NotImplementedError(fn)
+
+
+def setup_kwargs(defaults, kwargs):
+    """Merge defaults with kwargs, giving priority to kwargs."""
+    result = defaults.copy()
+    result.update(kwargs)
+    return result
+
+
+def filter_kwargs(fn, kwargs):
+    """Filter kwargs to only include those accepted by function fn."""
+    import inspect
+    sig = inspect.signature(fn)
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
+def _normalize(lognorm, weight, shape, dims, eps=1e-8):
+    n = torch.exp(lognorm).view(shape)
+    wn = torch.linalg.vector_norm(
+        x=weight, dim=dims, keepdim=True)
+    return n * weight / (wn + eps)
+
+
+def _dims(normalize_dim, ndims):
+    assert normalize_dim in [0, 1]
+    dims = list(range(ndims))
+    shape = [
+        1 if i != normalize_dim
+        else -1 for i in dims
+    ]
+    dims.pop(normalize_dim)
+    return dims, shape
+
+
+class FactorizedReduce(nn.Module):
+    def __init__(self, ci: int, co: int, **kwargs):
+        super(FactorizedReduce, self).__init__()
+        assert co % 2 == 0 and co > 4
+        co_each = co // 4
+        defaults = {
+            'kernel_size': 1,
+            'in_channels': ci,
+            'out_channels': co_each,
+            'reg_lognorm': True,
+            'stride': co // ci,
+            'padding': 0,
+            'bias': True,
+        }
+        kwargs = setup_kwargs(defaults, kwargs)
+        self.swish = nn.SiLU()
+        self.ops = nn.ModuleList()
+        for i in range(3):
+            self.ops.append(Conv2D(**kwargs))
+        kwargs['out_channels'] = co - 3 * co_each
+        self.ops.append(Conv2D(**kwargs))
+
+    def forward(self, x):
+        # Ensure even spatial size to keep the four branches aligned
+        H, W = x.shape[-2], x.shape[-1]
+        if H % 2 == 1: x = x[..., :-1, :]
+        if W % 2 == 1: x = x[..., :, :-1]
+
+        x = self.swish(x)
+        idx, out = 0, []
+        for op in self.ops:
+            i, j = idx // 2, idx % 2
+            out.append(op(x[..., i:, j:]))
+            idx += 1
+        return torch.cat(out, dim=1)
+
+
+class SELayer(nn.Module):
+    def __init__(self, ci: int, reduc: int = 16):
+        super(SELayer, self).__init__()
+        self.hdim = max(ci // reduc, 4)
+        self.fc = nn.Sequential(
+            nn.Linear(ci, self.hdim), nn.ReLU(inplace=True),
+            nn.Linear(self.hdim, ci), nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        se = torch.mean(x, dim=[2, 3])
+        se = self.fc(se).view(b, c, 1, 1)
+        return x * se
+
+
+class Conv2D(nn.Conv2d):
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int,
+            normalize_dim: int = 0,
+            reg_lognorm: bool = True,
+            init_scale: float = 1.0,
+            **kwargs,
+    ):
+        # Filter kwargs to only include valid Conv2d parameters
+        valid_kwargs = {}
+        for key in ['stride', 'padding', 'dilation', 'groups', 'bias', 'padding_mode']:
+            if key in kwargs:
+                # Special handling for groups - it should be an integer
+                if key == 'groups' and isinstance(kwargs[key], list):
+                    continue  # Skip invalid groups parameter
+                valid_kwargs[key] = kwargs[key]
+
+        super(Conv2D, self).__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            **valid_kwargs,
+        )
+        assert init_scale > 0
+        self.dims, self.shape = _dims(normalize_dim, 4)
+        init = torch.ones(self.out_channels).mul(init_scale)
+        self.lognorm = nn.Parameter(
+            data=torch.log(init),
+            requires_grad=reg_lognorm,
+        )
+        self._normalize_weight()
+
+    def forward(self, x):
+        self._normalize_weight()
+        return F.conv2d(
+            input=x,
+            weight=self.w,
+            bias=self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+
+    def _normalize_weight(self):
+        self.w = _normalize(
+            lognorm=self.lognorm,
+            weight=self.weight,
+            shape=self.shape,
+            dims=self.dims,
+        )
+
+
+class Cell(nn.Module):
+    def __init__(
+            self,
+            ci: int,
+            co: int,
+            n_nodes: int = 1,
+            cell_type: str = "normal",
+            act_fn: str = "SiLU",
+            use_bn: bool = True,
+            use_se: bool = False,
+            scale: float = 1.0,
+            eps: float = 0.1,
+            **kwargs,
+    ):
+        super(Cell, self).__init__()
+        assert n_nodes >= 1
+        kws_skip = filter_kwargs(
+            get_skip_connection, kwargs)
+        self.skip = get_skip_connection(
+            ci, MULT, cell_type, **kws_skip)
+        self.ops = nn.ModuleList()
+        for i in range(n_nodes):
+            op = ConvLayer(
+                ci=ci if i == 0 else co,
+                co=co,
+                stride=get_stride(cell_type, MULT)
+                if i == 0 else 1,
+                act_fn=act_fn,
+                use_bn=use_bn,
+                init_scale=scale
+                if i+1 == n_nodes
+                else 1.0,
+                **kwargs,
+            )
+            self.ops.append(op)
+        if use_se:
+            self.se = SELayer(co)
+        else:
+            self.se = None
+        self.eps = eps
+
+    def forward(self, x):
+        skip = self.skip(x)
+        for op in self.ops:
+            x = op(x)
+        if self.se is not None:
+            x = self.se(x)
+
+        # Ensure skip and main path have compatible spatial dimensions
+        if skip.shape[-2:] != x.shape[-2:]:
+            # Crop to minimum size to ensure compatibility
+            min_h = min(skip.shape[-2], x.shape[-2])
+            min_w = min(skip.shape[-1], x.shape[-1])
+            skip = skip[..., :min_h, :min_w]
+            x = x[..., :min_h, :min_w]
+
+        return skip + self.eps * x
+
+
+class ConvLayer(nn.Module):
+    def __init__(
+            self,
+            ci: int,
+            co: int,
+            stride: int,
+            act_fn: str,
+            use_bn: bool,
+            **kwargs,
+    ):
+        super(ConvLayer, self).__init__()
+        defaults = {
+            'in_channels': ci,
+            'out_channels': co,
+            'kernel_size': 3,
+            'normalize_dim': 0,
+            'reg_lognorm': True,
+            'init_scale': 1.0,
+            'stride': abs(stride),
+            'padding': 1,
+            'dilation': 1,
+            'groups': 1,
+            'bias': True,
+        }
+        if stride == -1:
+            self.upsample = nn.Upsample(
+                scale_factor=MULT,
+                mode='nearest',
+            )
+        else:
+            self.upsample = None
+        if use_bn:
+            self.bn = nn.BatchNorm2d(ci)
+        else:
+            self.bn = None
+        self.act_fn = get_act_fn(act_fn, False)
+        kwargs = setup_kwargs(defaults, kwargs)
+        self.conv = Conv2D(**kwargs)
+
+    def forward(self, x):
+        if self.bn is not None:
+            x = self.bn(x)
+        if self.act_fn is not None:
+            x = self.act_fn(x)
+        if self.upsample is not None:
+            x = self.upsample(x)
+        x = self.conv(x)
+        return x

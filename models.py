@@ -19,10 +19,13 @@ class RewardEMA:
     def __call__(self, x, ema_vals):
         flat_x = torch.flatten(x.detach())
         x_quantile = torch.quantile(input=flat_x, q=self.range)
-        # this should be in-place operation
-        ema_vals[:] = self.alpha * x_quantile + (1 - self.alpha) * ema_vals
-        scale = torch.clip(ema_vals[1] - ema_vals[0], min=1.0)
-        offset = ema_vals[0]
+        # Avoid in-place operation to prevent gradient computation issues
+        new_ema_vals = self.alpha * x_quantile + (1 - self.alpha) * ema_vals
+        # Update the buffer without in-place operation during gradient computation
+        with torch.no_grad():
+            ema_vals.copy_(new_ema_vals)
+        scale = torch.clip(new_ema_vals[1] - new_ema_vals[0], min=1.0)
+        offset = new_ema_vals[0]
         return offset.detach(), scale.detach()
 
 
@@ -35,12 +38,6 @@ class WorldModel(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
-        # Extract hierarchical parameters with defaults for backward compatibility
-        hierarchical_mode = getattr(config, 'hierarchical_mode', False)
-        stoch_top = getattr(config, 'dyn_stoch_top', config.dyn_stoch)
-        stoch_bottom = getattr(config, 'dyn_stoch_bottom', config.dyn_stoch)
-        discrete_top = getattr(config, 'dyn_discrete_top', config.dyn_discrete)
-        discrete_bottom = getattr(config, 'dyn_discrete_bottom', config.dyn_discrete)
 
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
@@ -58,42 +55,19 @@ class WorldModel(nn.Module):
             config.num_actions,
             self.embed_size,
             config.device,
-            # hDreamer hierarchical parameters
-            hierarchical_mode=hierarchical_mode,
-            stoch_top=stoch_top,
-            stoch_bottom=stoch_bottom,
-            discrete_top=discrete_top,
-            discrete_bottom=discrete_bottom,
         )
         self.heads = nn.ModuleDict()
-        # Calculate feature size based on hierarchical mode
-        if hierarchical_mode and config.dyn_discrete:
-            # For hierarchical mode: [z_top_flat, z_bottom_flat, h]
-            feat_size = (stoch_top * discrete_top +
-                        stoch_bottom * discrete_bottom +
-                        config.dyn_deter)
-            # Use LadderDecoder for hierarchical mode
-            self.heads["decoder"] = networks.LadderDecoder(
-                feat_size, shapes,
-                stoch_top=stoch_top,
-                stoch_bottom=stoch_bottom,
-                discrete_top=discrete_top,
-                discrete_bottom=discrete_bottom,
-                deter_size=config.dyn_deter,
-                **config.decoder
-            )
-        elif config.dyn_discrete:
-            # Original flat discrete: [z_flat, h]
+        # Calculate feature size
+        if config.dyn_discrete and not getattr(config, 'use_poisson', False):
+            # Discrete latents: [z_flat, h]
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
-            self.heads["decoder"] = networks.MultiDecoder(
-                feat_size, shapes, **config.decoder
-            )
         else:
-            # Original continuous: [z, h]
+            # Continuous or Poisson latents: [z, h]
             feat_size = config.dyn_stoch + config.dyn_deter
-            self.heads["decoder"] = networks.MultiDecoder(
-                feat_size, shapes, **config.decoder
-            )
+
+        self.heads["decoder"] = networks.MultiDecoder(
+            feat_size, shapes, **config.decoder
+        )
         self.heads["reward"] = networks.MLP(
             feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
@@ -224,7 +198,7 @@ class WorldModel(nn.Module):
         }
         obs["image"] = obs["image"] / 255.0
         if "discount" in obs:
-            obs["discount"] *= self._config.discount
+            obs["discount"] = obs["discount"] * self._config.discount
             # (batch_size, batch_length) -> (batch_size, batch_length, 1)
             obs["discount"] = obs["discount"].unsqueeze(-1)
         # 'is_first' is necesarry to initialize hidden state at training
@@ -252,7 +226,9 @@ class WorldModel(nn.Module):
         # observed image is given until 5 steps
         model = torch.cat([recon[:, :5], openl], 1)
         truth = data["image"][:6]
-        model = model
+
+        # Clamp model output to [0, 1] range for proper video visualization
+        model = torch.clamp(model, 0.0, 1.0)
         error = (model - truth + 1.0) / 2.0
 
         return torch.cat([truth, model, error], 2)
@@ -265,23 +241,14 @@ class ImagBehavior(nn.Module):
         self._config = config
         self._world_model = world_model
 
-        # Calculate feature size based on hierarchical mode (same as WorldModel)
-        hierarchical_mode = getattr(config, 'hierarchical_mode', False)
-        if hierarchical_mode and config.dyn_discrete:
-            stoch_top = getattr(config, 'dyn_stoch_top', config.dyn_stoch)
-            stoch_bottom = getattr(config, 'dyn_stoch_bottom', config.dyn_stoch)
-            discrete_top = getattr(config, 'dyn_discrete_top', config.dyn_discrete)
-            discrete_bottom = getattr(config, 'dyn_discrete_bottom', config.dyn_discrete)
-            # For hierarchical mode: [z_top_flat, z_bottom_flat, h]
-            feat_size = (stoch_top * discrete_top +
-                        stoch_bottom * discrete_bottom +
-                        config.dyn_deter)
-        elif config.dyn_discrete:
-            # Original flat discrete: [z_flat, h]
+        # Calculate feature size
+        if config.dyn_discrete and not getattr(config, 'use_poisson', False):
+            # Discrete latents: [z_flat, h]
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
-            # Original continuous: [z, h]
+            # Continuous or Poisson latents: [z, h]
             feat_size = config.dyn_stoch + config.dyn_deter
+        print(f"DEBUG ImagBehavior: Creating actor with feat_size={feat_size}, use_poisson={getattr(config, 'use_poisson', False)}")
         self.actor = networks.MLP(
             feat_size,
             (config.num_actions,),
@@ -491,6 +458,8 @@ class ImagBehavior(nn.Module):
         if self._config.critic["slow_target"]:
             if self._updates % self._config.critic["slow_target_update"] == 0:
                 mix = self._config.critic["slow_target_fraction"]
-                for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
-                    d.data = mix * s.data + (1 - mix) * d.data
+                # Use no_grad to avoid gradient computation issues with in-place operations
+                with torch.no_grad():
+                    for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
+                        d.data.copy_(mix * s.data + (1 - mix) * d.data)
             self._updates += 1

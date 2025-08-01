@@ -34,18 +34,22 @@ def _collect_data(evaluator, env, device, episodes, max_steps):
         obs = env.reset()
         done = False
         step_count = 0
-        
+
         # Initialize agent and latent states
         agent_state = None
         latent_state = None
         action = None
-        
+        prev_game_vars = obs.get('game_variables', None)
+
         while not done and step_count < max_steps:
             # Build observation tensor (only what's required by agent/wm)
-            obs_tensor = {
-                "image": torch.tensor(obs["image"]).unsqueeze(0).to(device)
-            }
             is_first = torch.tensor([step_count == 0]).to(device)
+            is_terminal = torch.tensor([done]).to(device)
+            obs_tensor = {
+                "image": torch.tensor(obs["image"]).unsqueeze(0).to(device),
+                "is_first": is_first,
+                "is_terminal": is_terminal
+            }
             
             with torch.no_grad():
                 wm = evaluator.agent._wm
@@ -69,9 +73,13 @@ def _collect_data(evaluator, env, device, episodes, max_steps):
             # Store latent vector
             latents.append(feat.squeeze(0).detach().cpu().numpy())
             
-            # Extract ground truth factors with angle conversion
-            raw_factors = extract_ground_truth_factors(obs)
-            
+            # Extract ground truth factors with previous state for deltas
+            raw_factors = extract_ground_truth_factors(obs, prev_game_vars)
+
+            # Update previous state for next iteration
+            if 'game_variables' in obs:
+                prev_game_vars = obs['game_variables']
+
             # Convert ego_delta_angle to sin/cos representation
             angle = raw_factors.pop("ego_delta_angle", 0.0)
             raw_factors["ego_delta_angle_sin"] = np.sin(angle)
@@ -81,8 +89,15 @@ def _collect_data(evaluator, env, device, episodes, max_steps):
             raw_factors["_episode_id"] = episode
             factors.append(raw_factors)
             
-            # Step environment
-            obs, reward, done, info = env.step(action.cpu().numpy()[0])
+            # Step environment - convert action to integer index
+            action_np = action.cpu().numpy()[0]
+            if len(action_np.shape) > 0 and action_np.shape[0] > 1:
+                # One-hot action, convert to index
+                action_idx = int(np.argmax(action_np))
+            else:
+                # Already scalar action
+                action_idx = int(action_np)
+            obs, reward, done, info = env.step(action_idx)
             step_count += 1
     
     return np.asarray(latents), factors
@@ -93,11 +108,11 @@ def _get_latent_blocks(latents, evaluator):
     wm = evaluator.agent._wm
     dyn = wm.dynamics
     
-    # Check if model is hierarchical
-    hierarchical = bool(
-        getattr(dyn, "_hierarchical_mode", False) and 
-        getattr(dyn, "_discrete", False)
-    )
+    # Detect hierarchical mode robustly
+    hierarchical = (hasattr(dyn, "_hierarchical_mode") and
+                   getattr(dyn, "_hierarchical_mode", False) and
+                   hasattr(dyn, "_stoch_top") and hasattr(dyn, "_stoch_bottom") and
+                   getattr(dyn, "_stoch_bottom", 0) > 0)
     
     if hierarchical:
         # Get hierarchical dimensions
@@ -186,26 +201,27 @@ def _probe_latent_block(X_train, X_test, factors, train_mask, test_mask, log_per
     return macro_r2, per_factor_r2
 
 
-def run_ego_probe(model_path, config_name, step, writer=None, device='cuda',
-                  episodes_train=6, episodes_test=4, max_steps_per_episode=300,
-                  log_per_factor=False, tb_dir=None):
+def run_ego_probe(model_path, config_name, episodes_train, episodes_test,
+                  max_steps_per_episode, device='cuda'):
     """
-    Run ego motion linear probing evaluation.
-    
+    Clean offline ego motion linear probing evaluation.
+
     Args:
         model_path: Path to trained model directory
-        config_name: Configuration name (e.g., 'vizdoom_basic')
-        step: Current training step for tensorboard x-axis
-        writer: Optional tensorboard writer (will create one if None)
-        device: Device to use for evaluation
+        config_name: Configuration name (e.g., 'vizdoom_health_gathering')
         episodes_train: Number of episodes for training linear probes
         episodes_test: Number of episodes for testing linear probes
         max_steps_per_episode: Maximum steps per episode
-        log_per_factor: Whether to log per-factor R² scores
-        tb_dir: Tensorboard directory (defaults to model_path/linear_probe_tb)
-    
+        device: Device to use for evaluation
+
     Returns:
-        Dict with macro and per-factor R² scores per scope
+        Dict with keys:
+            'hierarchical': bool,
+            'r2_total': float,
+            'r2_position': float,
+            'r2_velocity': float,
+            'r2_angle': float,
+            'scopes': dict with detailed per-scope results
     """
     model_path = pathlib.Path(model_path)
     task = config_name.replace("vizdoom_", "")
@@ -231,40 +247,44 @@ def run_ego_probe(model_path, config_name, step, writer=None, device='cuda',
             train_mask, test_mask = _create_episode_split(
                 factors, episodes_train, episodes_test
             )
-            
-            # Initialize tensorboard writer if needed
-            if writer is None:
-                tb_dir = tb_dir or (model_path / "linear_probe_tb")
-                writer = SummaryWriter(log_dir=str(tb_dir))
-            
+
             # Run probing for each latent block
             results = {"hierarchical": hierarchical, "scopes": {}}
             
             for scope_name, X in latent_blocks.items():
                 X_train = X[train_mask]
                 X_test = X[test_mask]
-                
+
                 macro_r2, per_factor_r2 = _probe_latent_block(
-                    X_train, X_test, factors, train_mask, test_mask, log_per_factor
+                    X_train, X_test, factors, train_mask, test_mask, False
                 )
-                
+
                 # Store results
                 results["scopes"][scope_name] = {
                     "macro_r2": macro_r2,
                     "per_factor": per_factor_r2
                 }
-                
-                # Log to tensorboard
-                writer.add_scalar(f"linear_probe/ego_r2_total_{scope_name}", macro_r2, step)
-                
-                if log_per_factor:
-                    for factor_name, r2_score in per_factor_r2.items():
-                        writer.add_scalar(
-                            f"linear_probe/ego_r2_{factor_name}_{scope_name}", 
-                            r2_score, step
-                        )
-            
-            writer.flush()
+
+            # Flatten probe output into the four summary keys
+            block = results['scopes'].get('combined') or results['scopes'].get('all')
+            if block:
+                results['r2_total'] = float(block['macro_r2'])
+                results['r2_position'] = float(block['per_factor'].get('ego_delta_x', 0.0))
+
+                # Average velocity R² across x, y, z components
+                vel = ['ego_vel_x', 'ego_vel_y', 'ego_vel_z']
+                results['r2_velocity'] = float(sum(block['per_factor'].get(f, 0.0) for f in vel) / 3)
+
+                # Average angle R² across sin/cos components
+                a_s = block['per_factor'].get('ego_delta_angle_sin', 0.0)
+                a_c = block['per_factor'].get('ego_delta_angle_cos', 0.0)
+                results['r2_angle'] = float((a_s + a_c) / 2)
+            else:
+                # Fallback if no primary block found
+                results['r2_total'] = 0.0
+                results['r2_position'] = 0.0
+                results['r2_velocity'] = 0.0
+                results['r2_angle'] = 0.0
             
     finally:
         env.close()

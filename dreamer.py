@@ -16,6 +16,8 @@ import models
 import tools
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
+import vae_utils
+from world_model_custom import WorldModelCustom
 
 import torch
 from torch import nn
@@ -58,8 +60,64 @@ class Dreamer(nn.Module):
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
-        self._wm = models.WorldModel(obs_space, act_space, self._step, config)
+        # Use WorldModelCustom if CNVAE or Poisson latents are enabled, otherwise use original
+        print(f"DEBUG: use_cnvae={getattr(config, 'use_cnvae', False)}, use_poisson={getattr(config, 'use_poisson', False)}")
+        if getattr(config, 'use_cnvae', False) or getattr(config, 'use_poisson', False):
+            print("DEBUG: Using WorldModelCustom")
+            self._wm = WorldModelCustom(obs_space, act_space, self._step, config)
+        else:
+            print("DEBUG: Using original WorldModel")
+            self._wm = models.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = models.ImagBehavior(config, self._wm)
+
+        # Initialize KL annealing schedules for CNVAE if enabled
+        if getattr(config, 'use_cnvae', False):
+            # Calculate total world model updates
+            if getattr(config, 'kl_anneal_complete_at_prefill', False):
+                # Complete KL annealing by end of prefill phase
+                prefill_steps = config.prefill
+                batch_steps = config.batch_size * config.batch_length
+                train_ratio = config.train_ratio
+                # Calculate how many world model updates happen during prefill
+                self._n_iters = int(prefill_steps * train_ratio / batch_steps)
+                print(f"KL annealing will complete after {self._n_iters} world model updates (during prefill phase)")
+            else:
+                # Use total training steps for annealing
+                total_steps = config.steps
+                batch_steps = config.batch_size * config.batch_length
+                train_ratio = config.train_ratio
+                self._n_iters = int(total_steps * train_ratio / batch_steps)
+                print(f"KL annealing will complete after {self._n_iters} world model updates (over full training)")
+
+            # Build KL annealing schedules
+            self._betas = vae_utils.beta_anneal_linear(
+                self._n_iters,
+                beta=getattr(config, 'kl_beta', 1.0),
+                anneal_portion=getattr(config, 'kl_anneal_portion', 0.3),
+                constant_portion=getattr(config, 'kl_const_portion', 0.0),
+                min_beta=getattr(config, 'kl_beta_min', 1e-4)
+            )
+
+            # Build KL balancer coefficients
+            if hasattr(self._wm, 'bottleneck') and hasattr(self._wm.bottleneck, 'groups'):
+                groups = self._wm.bottleneck.groups
+            else:
+                # Fallback to config groups
+                cnvae_cfg = getattr(config, 'cnvae_cfg', {})
+                groups = cnvae_cfg.get('groups', [2, 2, 2, 1])
+
+            self._alphas = vae_utils.kl_balancer_coeff(
+                groups,
+                getattr(config, 'kl_balancer', 'equal')
+            )
+
+            # Pass schedules to WorldModel if it's WorldModelCustom
+            if hasattr(self._wm, '_alphas'):
+                self._wm._alphas = self._alphas
+                self._wm._betas = self._betas
+        else:
+            self._betas = None
+            self._alphas = None
         if (
             config.compile and os.name != "nt"
         ):  # compilation is not supported on windows
@@ -279,7 +337,41 @@ def main(config):
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
         tools.enable_deterministic_run()
-    logdir = pathlib.Path(config.logdir).expanduser()
+
+    # Disable anomaly detection for performance
+    # torch.autograd.set_detect_anomaly(True)
+
+    # Auto-generate logdir if not specified or if it's a default model logdir
+    if (config.logdir is None or
+        config.logdir in ['./logdir/dreamer', './logdir/pdreamer', './logdir/hidreamer']):
+
+        # Determine model name from config names used
+        config_names = getattr(config, '_config_names', [])
+        model_name = None
+
+        # Check for explicit model configs first
+        for name in config_names:
+            if name in ['dreamer', 'pdreamer', 'hidreamer']:
+                model_name = name
+                break
+
+        # If no explicit model config, infer from flags
+        if model_name is None:
+            if getattr(config, 'use_cnvae', False) and getattr(config, 'use_poisson', False):
+                model_name = "cnvae_pdreamer"
+            elif getattr(config, 'use_cnvae', False):
+                model_name = "hidreamer"
+            elif getattr(config, 'use_poisson', False):
+                model_name = "pdreamer"
+            else:
+                model_name = "dreamer"
+
+        # Generate logdir: model_task_seed_X
+        logdir_name = f"{model_name}_{config.task}_seed_{config.seed}"
+        logdir = pathlib.Path("./logdir") / logdir_name
+    else:
+        logdir = pathlib.Path(config.logdir).expanduser()
+
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
     config.steps //= config.action_repeat
@@ -293,7 +385,24 @@ def main(config):
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step)
+
+    # Choose logger based on config
+    use_wandb = getattr(config, 'use_wandb', False)
+    if use_wandb:
+        # Convert config to dict for wandb
+        config_dict = {k: v for k, v in vars(config).items()
+                      if not k.startswith('_') and not callable(v)}
+        logger = tools.WandbLogger(
+            logdir,
+            config.action_repeat * step,
+            entity=getattr(config, 'wandb_entity', 'yateslab'),
+            project=getattr(config, 'wandb_project', 'dreamer'),
+            config=config_dict
+        )
+        print("Using Weights & Biases logging")
+    else:
+        logger = tools.Logger(logdir, config.action_repeat * step)
+        print("Using TensorBoard logging")
 
     print("Create envs.")
     if config.offline_traindir:
@@ -434,4 +543,8 @@ if __name__ == "__main__":
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
         arg_type = tools.args_type(value)
         parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
-    main(parser.parse_args(remaining))
+
+    # Parse final config and add the config names for model detection
+    final_config = parser.parse_args(remaining)
+    final_config._config_names = args.configs or []
+    main(final_config)
