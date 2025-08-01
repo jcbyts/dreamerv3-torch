@@ -19,13 +19,10 @@ class RewardEMA:
     def __call__(self, x, ema_vals):
         flat_x = torch.flatten(x.detach())
         x_quantile = torch.quantile(input=flat_x, q=self.range)
-        # Avoid in-place operation to prevent gradient computation issues
-        new_ema_vals = self.alpha * x_quantile + (1 - self.alpha) * ema_vals
-        # Update the buffer without in-place operation during gradient computation
-        with torch.no_grad():
-            ema_vals.copy_(new_ema_vals)
-        scale = torch.clip(new_ema_vals[1] - new_ema_vals[0], min=1.0)
-        offset = new_ema_vals[0]
+        # this should be in-place operation
+        ema_vals[:] = self.alpha * x_quantile + (1 - self.alpha) * ema_vals
+        scale = torch.clip(ema_vals[1] - ema_vals[0], min=1.0)
+        offset = ema_vals[0]
         return offset.detach(), scale.detach()
 
 
@@ -38,7 +35,6 @@ class WorldModel(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
-
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
             config.dyn_deter,
@@ -57,14 +53,10 @@ class WorldModel(nn.Module):
             config.device,
         )
         self.heads = nn.ModuleDict()
-        # Calculate feature size
-        if config.dyn_discrete and not getattr(config, 'use_poisson', False):
-            # Discrete latents: [z_flat, h]
+        if config.dyn_discrete:
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
-            # Continuous or Poisson latents: [z, h]
             feat_size = config.dyn_stoch + config.dyn_deter
-
         self.heads["decoder"] = networks.MultiDecoder(
             feat_size, shapes, **config.decoder
         )
@@ -129,12 +121,8 @@ class WorldModel(nn.Module):
                 kl_free = self._config.kl_free
                 dyn_scale = self._config.dyn_scale
                 rep_scale = self._config.rep_scale
-                # Get annealing parameters from config with defaults
-                free_bits_max = getattr(self._config, 'kl_free_bits_max', 1.0)
-                anneal_steps = getattr(self._config, 'kl_anneal_steps', 50000)
-                kl_loss, kl_value, dyn_loss, rep_loss, kl_info = self.dynamics.kl_loss(
-                    post, prior, kl_free, dyn_scale, rep_scale,
-                    step=self._step, free_bits_max=free_bits_max, anneal_steps=anneal_steps
+                kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
+                    post, prior, kl_free, dyn_scale, rep_scale
                 )
                 assert kl_loss.shape == embed.shape[:2], kl_loss.shape
                 preds = {}
@@ -166,14 +154,6 @@ class WorldModel(nn.Module):
         metrics["dyn_loss"] = to_np(dyn_loss)
         metrics["rep_loss"] = to_np(rep_loss)
         metrics["kl"] = to_np(torch.mean(kl_value))
-
-        # Add hierarchical KL logging if available
-        if kl_info:
-            for key, value in kl_info.items():
-                if torch.is_tensor(value):
-                    metrics[f"kl_{key}"] = to_np(torch.mean(value))
-                else:
-                    metrics[f"kl_{key}"] = value
         with torch.cuda.amp.autocast(self._use_amp):
             metrics["prior_ent"] = to_np(
                 torch.mean(self.dynamics.get_dist(prior).entropy())
@@ -198,7 +178,7 @@ class WorldModel(nn.Module):
         }
         obs["image"] = obs["image"] / 255.0
         if "discount" in obs:
-            obs["discount"] = obs["discount"] * self._config.discount
+            obs["discount"] *= self._config.discount
             # (batch_size, batch_length) -> (batch_size, batch_length, 1)
             obs["discount"] = obs["discount"].unsqueeze(-1)
         # 'is_first' is necesarry to initialize hidden state at training
@@ -226,9 +206,7 @@ class WorldModel(nn.Module):
         # observed image is given until 5 steps
         model = torch.cat([recon[:, :5], openl], 1)
         truth = data["image"][:6]
-
-        # Clamp model output to [0, 1] range for proper video visualization
-        model = torch.clamp(model, 0.0, 1.0)
+        model = model
         error = (model - truth + 1.0) / 2.0
 
         return torch.cat([truth, model, error], 2)
@@ -240,15 +218,10 @@ class ImagBehavior(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         self._world_model = world_model
-
-        # Calculate feature size
-        if config.dyn_discrete and not getattr(config, 'use_poisson', False):
-            # Discrete latents: [z_flat, h]
+        if config.dyn_discrete:
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
-            # Continuous or Poisson latents: [z, h]
             feat_size = config.dyn_stoch + config.dyn_deter
-        print(f"DEBUG ImagBehavior: Creating actor with feat_size={feat_size}, use_poisson={getattr(config, 'use_poisson', False)}")
         self.actor = networks.MLP(
             feat_size,
             (config.num_actions,),
@@ -458,8 +431,6 @@ class ImagBehavior(nn.Module):
         if self._config.critic["slow_target"]:
             if self._updates % self._config.critic["slow_target_update"] == 0:
                 mix = self._config.critic["slow_target_fraction"]
-                # Use no_grad to avoid gradient computation issues with in-place operations
-                with torch.no_grad():
-                    for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
-                        d.data.copy_(mix * s.data + (1 - mix) * d.data)
+                for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
+                    d.data = mix * s.data + (1 - mix) * d.data
             self._updates += 1
