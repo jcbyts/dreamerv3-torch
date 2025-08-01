@@ -16,24 +16,12 @@ import models
 import tools
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
-import vae_utils
-from world_model_custom import WorldModelCustom
 
 import torch
 from torch import nn
 from torch import distributions as torchd
 
-# Linear probing evaluation - use lazy import to avoid circular dependencies
-LINEAR_PROBE_AVAILABLE = True  # Assume available, check on first use
-
-def _get_linear_probe_function():
-    """Lazy import of linear probing to avoid circular dependencies."""
-    try:
-        from eval_ego_linear_probe import run_ego_probe
-        return run_ego_probe
-    except ImportError as e:
-        print(f"Warning: Linear probing evaluation not available. Error: {e}")
-        return None
+# Linear probing removed for vanilla dreamer
 
 
 to_np = lambda x: x.detach().cpu().numpy()
@@ -51,73 +39,16 @@ class Dreamer(nn.Module):
         self._should_reset = tools.Every(config.reset_every)
         self._should_expl = tools.Until(int(config.expl_until / config.action_repeat))
 
-        # Linear probing evaluation scheduling
-        linear_probe_every = getattr(config, 'linear_probe_every', 20000)
-        self._should_linear_probe = tools.Every(linear_probe_every)
+        # Linear probing scheduling removed (moved to legacy/)
 
         self._metrics = {}
         # this is update step
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
-        # Use WorldModelCustom if CNVAE or Poisson latents are enabled, otherwise use original
-        print(f"DEBUG: use_cnvae={getattr(config, 'use_cnvae', False)}, use_poisson={getattr(config, 'use_poisson', False)}")
-        if getattr(config, 'use_cnvae', False) or getattr(config, 'use_poisson', False):
-            print("DEBUG: Using WorldModelCustom")
-            self._wm = WorldModelCustom(obs_space, act_space, self._step, config)
-        else:
-            print("DEBUG: Using original WorldModel")
-            self._wm = models.WorldModel(obs_space, act_space, self._step, config)
+        # Use vanilla dreamer WorldModel
+        self._wm = models.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = models.ImagBehavior(config, self._wm)
-
-        # Initialize KL annealing schedules for CNVAE if enabled
-        if getattr(config, 'use_cnvae', False):
-            # Calculate total world model updates
-            if getattr(config, 'kl_anneal_complete_at_prefill', False):
-                # Complete KL annealing by end of prefill phase
-                prefill_steps = config.prefill
-                batch_steps = config.batch_size * config.batch_length
-                train_ratio = config.train_ratio
-                # Calculate how many world model updates happen during prefill
-                self._n_iters = int(prefill_steps * train_ratio / batch_steps)
-                print(f"KL annealing will complete after {self._n_iters} world model updates (during prefill phase)")
-            else:
-                # Use total training steps for annealing
-                total_steps = config.steps
-                batch_steps = config.batch_size * config.batch_length
-                train_ratio = config.train_ratio
-                self._n_iters = int(total_steps * train_ratio / batch_steps)
-                print(f"KL annealing will complete after {self._n_iters} world model updates (over full training)")
-
-            # Build KL annealing schedules
-            self._betas = vae_utils.beta_anneal_linear(
-                self._n_iters,
-                beta=getattr(config, 'kl_beta', 1.0),
-                anneal_portion=getattr(config, 'kl_anneal_portion', 0.3),
-                constant_portion=getattr(config, 'kl_const_portion', 0.0),
-                min_beta=getattr(config, 'kl_beta_min', 1e-4)
-            )
-
-            # Build KL balancer coefficients
-            if hasattr(self._wm, 'bottleneck') and hasattr(self._wm.bottleneck, 'groups'):
-                groups = self._wm.bottleneck.groups
-            else:
-                # Fallback to config groups
-                cnvae_cfg = getattr(config, 'cnvae_cfg', {})
-                groups = cnvae_cfg.get('groups', [2, 2, 2, 1])
-
-            self._alphas = vae_utils.kl_balancer_coeff(
-                groups,
-                getattr(config, 'kl_balancer', 'equal')
-            )
-
-            # Pass schedules to WorldModel if it's WorldModelCustom
-            if hasattr(self._wm, '_alphas'):
-                self._wm._alphas = self._alphas
-                self._wm._betas = self._betas
-        else:
-            self._betas = None
-            self._alphas = None
         if (
             config.compile and os.name != "nt"
         ):  # compilation is not supported on windows
@@ -150,49 +81,8 @@ class Dreamer(nn.Module):
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
 
-                # Run linear probing evaluation if enabled and scheduled
-                if (self._should_linear_probe(step) and
-                    step > 0 and
-                    hasattr(self._config, 'task') and
-                    'vizdoom' in self._config.task):
-
-                    # Get linear probing function (lazy import)
-                    run_ego_probe = _get_linear_probe_function()
-
-                    if run_ego_probe is not None:
-                        try:
-                            print(f"Running ego motion linear probing at step {step}...")
-
-                            # Get linear probing parameters from config
-                            episodes_train = getattr(self._config, 'linear_probe_episodes_train', 6)
-                            episodes_test = getattr(self._config, 'linear_probe_episodes_test', 4)
-                            max_steps = getattr(self._config, 'linear_probe_max_steps', 300)
-                            log_per_factor = getattr(self._config, 'linear_probe_log_per_factor', False)
-
-                            # Run linear probing evaluation
-                            results = run_ego_probe(
-                                model_path=self._logger.logdir,
-                                config_name=self._config.task,
-                                step=step,
-                                writer=self._logger._writer,  # Use existing tensorboard writer
-                                device=self._config.device,
-                                episodes_train=episodes_train,
-                                episodes_test=episodes_test,
-                                max_steps_per_episode=max_steps,
-                                log_per_factor=log_per_factor
-                            )
-
-                            # Log summary to console
-                            model_type = "Hierarchical" if results['hierarchical'] else "Flat"
-                            print(f"Linear probing complete ({model_type} model):")
-                            for scope_name, scope_results in results["scopes"].items():
-                                macro_r2 = scope_results["macro_r2"]
-                                print(f"  {scope_name.capitalize()}: Macro R² = {macro_r2:.3f}")
-
-                        except Exception as e:
-                            print(f"Warning: Linear probing failed at step {step}: {e}")
-                    else:
-                        print(f"Warning: Linear probing skipped at step {step} - not available")
+                # Linear probing disabled for vanilla dreamer
+                # (Can be re-enabled later if needed)
 
                 self._logger.write(fps=True)
 
