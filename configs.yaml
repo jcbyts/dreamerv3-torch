@@ -39,39 +39,22 @@ defaults:
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
 
+  # Hierarchical VAE Configuration
+  encoder_type: 'original'        # ['original', 'unet_flat', 'densenet_ladder']
+  ladder_levels: 1                # Number of hierarchical levels (1 = vanilla Dreamer)
+  kl_balancing: false             # Enable per-level KL balancing with free-bits
+  dense_growth: 32                # DenseNet growth rate (filters added per layer)
+  dense_block_layers: 4           # Number of dense layers per block
+  dense_compression: 0.5          # Channel compression ratio in transitions
+
 
   # KL annealing parameters for hierarchical mode
   kl_free_bits_max: 1.0  # Maximum free bits value for annealing
   kl_anneal_steps: 50000 # Number of steps over which to anneal free bits
 
-  # CNVAE and Poisson latent configuration
-  use_cnvae: false       # Enable hierarchical CNVAE encoder/decoder
-  use_poisson: false     # Enable Poisson latent distributions in RSSM
-  poisson_temp: 1.0      # Temperature for Poisson softening (0.0 = hard, >0 = soft)
-  cnvae_cfg:             # CNVAE configuration parameters
-    scales: [64, 32, 16, 8]      # spatial resolutions for each level
-    groups: [2, 2, 2, 1]         # number of latent groups per scale
-    ch: 32                       # base channel width
-    latent_dim: 32               # latent dimension per group
-    in_channels: 3               # input image channels
-    out_channels: 3              # output image channels
-    input_sz: [64, 64]           # input image size
-    ker_sz: 3                    # kernel size
-    n_pre_blocks: 1              # number of pre-processing blocks
-    n_pre_cells: 2               # number of cells per pre-processing block
-    n_enc_cells: 2               # number of encoder cells per scale
-    n_dec_cells: 2               # number of decoder cells per scale
-    n_post_blocks: 1             # number of post-processing blocks
-    n_post_cells: 2              # number of cells per post-processing block
-    compress: true               # whether to compress latents spatially
-    activation_fn: "SiLU"        # activation function
-    use_bn: true                 # use batch normalization
-    use_se: false                # use squeeze-and-excitation blocks
-    spectral_norm: 0             # spectral normalization strength (0 = disabled)
-
   # KL annealing and balancing parameters for CNVAE
   kl_beta: 1.0                   # final beta value for KL annealing
-  kl_beta_min: 1e-4              # minimum beta value
+  kl_beta_min: 1.0e-4              # minimum beta value
   kl_anneal_portion: 0.3         # portion of training for annealing
   kl_const_portion: 0.0          # portion of training at minimum beta
   kl_balancer: "equal"           # KL balancing scheme: equal, linear, sqrt, square
@@ -92,9 +75,9 @@ defaults:
   decoder:
     {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
   actor:
-    {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+    {layers: 2, dist: 'normal', entropy: 3.0e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3.0e-5, eps: 1.0e-5, grad_clip: 100.0, outscale: 1.0}
   critic:
-    {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+    {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3.0e-5, eps: 1.0e-5, grad_clip: 100.0, outscale: 0.0}
   reward_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   cont_head:
@@ -111,8 +94,8 @@ defaults:
   batch_length: 64
   train_ratio: 512
   pretrain: 100
-  model_lr: 1e-4
-  opt_eps: 1e-8
+  model_lr: 1.0e-4
+  opt_eps: 1.0e-8
   grad_clip: 1000
   dataset_size: 1000000
   opt: 'adam'
@@ -301,11 +284,38 @@ vizdoom_health_gathering:
 
 tiny_dreamerv3:
   # Tiny DreamerV3: just smaller latent space, everything else same as vizdoom config
+  encoder_type: 'original'
+  ladder_levels: 1
+  kl_balancing: false
   dyn_hidden: 256
   dyn_deter: 256
   dyn_stoch: 12   # Total latent capacity: 12 * 32 = 384
   dyn_discrete: 32
   hierarchical_mode: false
+
+  # VizDoom compatibility
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  envs: 4
+
+  # Video logging
+  video_pred_log: true
+  eval_episode_num: 10
+
+# Tiny hierarchical variant for fast testing
+tiny_hdreamer:
+  # Tiny hDreamer: matched latent capacity (3 levels × 4 stoch = 12 total)
+  encoder_type: 'densenet_ladder'
+  ladder_levels: 3
+  kl_balancing: true
+  dense_growth: 16        # Smaller growth for faster training
+  dense_block_layers: 3   # Fewer layers per block
+  dense_compression: 0.5
+  dyn_hidden: 256
+  dyn_deter: 256
+  dyn_stoch: 12   # Total latent capacity: 12 * 32 = 384 (split across 3 levels)
+  dyn_discrete: 32
+  hierarchical_mode: true
 
   # VizDoom compatibility
   actor: {dist: 'onehot', std: 'none'}
@@ -327,9 +337,95 @@ debug:
 # Model Variants
 # 1) dreamer: vanilla DreamerV3 with categorical latents and original encoder/decoder
 dreamer:
-  use_cnvae: false
-  use_poisson: false
+  # ------------ logging ---------------------------------------------
   use_wandb: true
   wandb_entity: 'yateslab'
   wandb_project: 'dreamer'
 
+  # ------------ choose world model ----------------------------------
+  model: flat              # flat RSSM, uses dyn_* below
+  # ------------ latent / RSSM ---------------------------------------
+  dyn_hidden:   512        # size of hidden MLP in stat heads (flat)
+  dyn_deter:    512        # deterministic GRU state
+  dyn_stoch:     32        # number of categorical variables
+  dyn_discrete:  32        # categories per variable
+  dyn_rec_depth: 1         # RSSM recurrent depth
+  dyn_mean_act: 'none'
+  dyn_std_act:  'sigmoid2'
+  dyn_min_std:  0.1
+  # ------------ optimiser scales ------------------------------------
+  kl_free:      1.0
+  dyn_scale:    0.5
+  rep_scale:    0.1
+
+# 2) hdreamer: hierarchical DreamerV3 with hWorldModel and hRSSM
+hdreamer:
+  # ------------ logging ---------------------------------------------
+  use_wandb: true
+  wandb_entity: 'yateslab'
+  wandb_project: 'hdreamer'
+
+  # ------------ choose world model ----------------------------------
+  model: h                 # use hWorldModel
+
+  # ------------ hierarchical RSSM block -----------------------------
+  rssm:
+    h_levels:      3
+    h_hidden_dim:  256      # hidden size in stat heads
+    h_stoch_dims: [10, 10, 12]   # per-level categorical variables
+    h_deter_dims: [128, 128, 256] # per-level GRU chunks
+    discrete:      32       # categories per variable
+    act: 'SiLU'
+    norm: true
+    up_mode: 'nearest'
+
+  # ------------ encoder configuration (for hConvEncoder) ------------
+  encoder:
+    depth: 32               # base channel depth
+    levels: 3               # number of hierarchical levels (matches rssm.h_levels)
+    act: 'SiLU'
+    norm: true
+    kernel_size: 4
+    minres: 4
+
+  # ------------ decoder configuration (for DecoderHead) -------------
+  decoder:
+    cnn_sigmoid: false
+
+  # ------------ shared parameters -----------------------------------
+  units: 512
+  act: 'SiLU'
+  norm: true
+  device: 'cuda:0'
+  num_actions: 7           # VizDoom action space size
+
+  # ------------ prediction heads ------------------------------------
+  reward_head:
+    layers: 2
+    dist: 'symlog_disc'
+    loss_scale: 1.0
+    outscale: 0.0
+
+  cont_head:
+    layers: 2
+    loss_scale: 1.0
+    outscale: 1.0
+
+  grad_heads: ['decoder', 'reward', 'cont']
+
+  # ------------ optimizer configuration -----------------------------
+  model_lr: 1.0e-4
+  opt_eps: 1.0e-8
+  grad_clip: 1000
+  weight_decay: 0.0
+  opt: 'adam'
+
+  # ------------ KL & scales (applied per-level inside hRSSM) --------
+  kl_free:      1.0
+  dyn_scale:    0.5
+  rep_scale:    0.1
+  unimix_ratio: 0.01
+  initial: 'learned'
+  dyn_mean_act: 'none'
+  dyn_std_act: 'sigmoid2'
+  dyn_min_std: 0.1

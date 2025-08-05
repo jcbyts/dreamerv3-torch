@@ -1,9 +1,11 @@
 import copy
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 import networks
 import tools
+
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -26,6 +28,9 @@ class RewardEMA:
         return offset.detach(), scale.detach()
 
 
+#-----------------------------------------------------------------
+# Original WorldModel
+# ----------------------------------------------------------------
 class WorldModel(nn.Module):
     def __init__(self, obs_space, act_space, step, config):
         super(WorldModel, self).__init__()
@@ -434,3 +439,235 @@ class ImagBehavior(nn.Module):
                 for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
                     d.data = mix * s.data + (1 - mix) * d.data
             self._updates += 1
+
+
+#-----------------------------------------------------------------
+# Hierarchical World Model
+# ----------------------------------------------------------------
+
+class DecoderHead(nn.Module):
+    """
+    A simple decoder head that takes the final spatial feature map from the hRSSM
+    and reconstructs the image.
+    """
+    def __init__(self, input_channels, output_shape=(3, 64, 64), cnn_sigmoid=False):
+        super().__init__()
+        self._output_shape = output_shape
+        self._cnn_sigmoid = cnn_sigmoid
+        # This final convolution maps the spatial features to image channels.
+        self.conv = nn.Conv2d(input_channels, output_shape[0], kernel_size=1)
+        print(f"DecoderHead initialized to output shape {output_shape}.")
+        print(f"Input channels: {input_channels}")
+
+    def forward(self, spatial_features):
+        # Accept (B,T,C,H,W) or (BT,C,H,W)
+        if spatial_features.ndim == 5:
+            B, T, C, H, W = spatial_features.shape
+            x = spatial_features.reshape(B*T, C, H, W)
+            batch_shape = (B, T)
+        else:
+            BT, C, H, W = spatial_features.shape
+            x = spatial_features
+            batch_shape = (BT,)
+
+        target_hw = self._output_shape[1], self._output_shape[2]
+        if (H, W) != target_hw:
+            x = F.interpolate(x, size=target_hw, mode='bilinear', align_corners=False)
+
+        mean = self.conv(x)  # (BT, C_out, Ht, Wt) with (Ht,Wt)==target_hw
+        if len(batch_shape) == 2:
+            B, T = batch_shape
+            mean = mean.reshape(B, T, *self._output_shape)
+        else:
+            mean = mean.reshape(batch_shape[0], 1, *self._output_shape)  # degenerate T=1
+
+        mean = mean.permute(0, 1, 3, 4, 2)  # (B,T,H,W,C)
+        mean = F.sigmoid(mean) if self._cnn_sigmoid else (mean + 0.5)
+        return {'image': tools.MSEDist(mean)}
+
+class hWorldModel(WorldModel):
+    """
+    Hierarchical World Model.
+    Orchestrates the hConvEncoder, hRSSM, and a simplified decoder head.
+    """
+    def __init__(self, obs_space, act_space, step, config):
+        super(WorldModel, self).__init__()
+        self._step = step
+        self._use_amp = True if config.precision == 16 else False
+        self._config = config
+        
+        shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
+        
+        self.encoder = networks.hConvEncoder(shapes['image'], **config.encoder)
+
+        # Calculate encoder output channel dimensions for each level
+        # hConvEncoder produces: [stem(depth), block1(depth*2), block2(depth*4), ...]
+        encoder_dims = [config.encoder['depth'] * (2**i) for i in range(config.encoder['levels'])]
+        
+        self.dynamics = networks.hRSSM(
+            h_encoder_dims=list(reversed(encoder_dims)),
+            **config.rssm,
+            **config,
+        )
+        
+        self.heads = nn.ModuleDict()
+
+        # The decoder head now takes its input from the hRSSM's spatial features
+        spatial_channels = self.dynamics.spatial_channels()
+        self.heads["decoder"] = DecoderHead(
+            spatial_channels, shapes['image'], config.decoder['cnn_sigmoid']
+        )
+        
+        feat_size = sum(config.rssm['h_stoch_dims']) + sum(config.rssm['h_deter_dims'])
+
+        self.heads["reward"] = networks.MLP(
+            feat_size,
+            (255,) if config.reward_head["dist"] == "symlog_disc" else (),
+            config.reward_head["layers"],
+            config.units,
+            config.act,
+            config.norm,
+            dist=config.reward_head["dist"],
+            outscale=config.reward_head["outscale"],
+            device=config.device,
+            name="Reward",
+        )
+        self.heads["cont"] = networks.MLP(
+            feat_size,
+            (),
+            config.cont_head["layers"],
+            config.units,
+            config.act,
+            config.norm,
+            dist="binary",
+            outscale=config.cont_head["outscale"],
+            device=config.device,
+            name="Cont",
+        )
+
+        for name in config.grad_heads:
+            assert name in self.heads, name
+            
+        self._model_opt = tools.Optimizer(
+            "model",
+            self.parameters(),
+            config.model_lr,
+            config.opt_eps,
+            config.grad_clip,
+            config.weight_decay,
+            opt=config.opt,
+            use_amp=self._use_amp,
+        )
+        print(
+            f"Optimizer h_model_opt has {sum(param.numel() for param in self.parameters())} variables."
+        )
+        self._scales = dict(
+            reward=config.reward_head["loss_scale"],
+            cont=config.cont_head["loss_scale"],
+        )
+
+    def _train(self, data):
+        data = self.preprocess(data)
+
+        with tools.RequiresGrad(self):
+            with torch.amp.autocast('cuda', enabled=self._use_amp):
+                embed_list = self.encoder(data)
+                
+                # hRSSM.observe now returns the final spatial feature map as the second element
+                post, prior, spatial_post = self.dynamics.observe(
+                    embed_list, data["action"], data["is_first"]
+                )
+                
+                kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
+                    post, prior, self._config.kl_free, self._config.dyn_scale, self._config.rep_scale
+                )
+                
+                preds = {}
+                # Handle decoder separately as it uses spatial features
+                decoder_pred = self.heads['decoder'](spatial_post)
+                preds.update(decoder_pred)
+
+                for name, head in self.heads.items():
+                    if name == 'decoder': continue
+                    grad_head = name in self._config.grad_heads
+                    feat = self.dynamics.get_feat(post)
+                    feat = feat if grad_head else feat.detach()
+                    pred = head(feat)
+                    preds[name] = pred
+                
+                losses = {}
+                for name, pred in preds.items():
+                    loss = -pred.log_prob(data[name])
+                    losses[name] = loss
+                
+                scaled = {
+                    key: value * self._scales.get(key, 1.0)
+                    for key, value in losses.items()
+                }
+                model_loss = sum(scaled.values()) + kl_loss
+                
+            metrics = self._model_opt(torch.mean(model_loss), self.parameters())
+
+        metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
+        metrics["kl_free"] = self._config.kl_free
+        metrics["dyn_scale"] = self._config.dyn_scale
+        metrics["rep_scale"] = self._config.rep_scale
+        metrics["dyn_loss"] = to_np(torch.mean(dyn_loss))
+        metrics["rep_loss"] = to_np(torch.mean(rep_loss))
+        metrics["kl"] = to_np(torch.mean(kl_value))
+        
+        post_detached = {k: (v if not isinstance(v, list) else [i.detach() for i in v]) for k, v in post.items()}
+        return post_detached, {}, metrics
+
+    # how many channels does _build_spatial() output?
+    def spatial_channels(self):
+        z = sum(d * self._discrete if self._discrete else d
+                for d in self._h_stoch_dims)
+        d = sum(self._h_deter_dims)
+        return z + d 
+    
+    def preprocess(self, obs):
+        obs = {
+            k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
+            for k, v in obs.items()
+        }
+        if "discount" in obs:
+            obs["discount"] *= self._config.discount
+            obs["discount"] = obs["discount"].unsqueeze(-1)
+        assert "is_first" in obs
+        assert "is_terminal" in obs
+        obs["cont"] = (1.0 - obs["is_terminal"]).unsqueeze(-1)
+        obs["image"] = obs["image"] / 255.0  # image normalized ot [0, 1]
+        
+        return obs
+
+    def video_pred(self, data):
+        data = self.preprocess(data)
+        
+        # Get initial state from a short context sequence
+        context_len = 5
+        embed_list = self.encoder(data)
+        states, prior, spatial_states = self.dynamics.observe(
+            [e[:, :context_len] for e in embed_list], 
+            data["action"][:, :context_len], 
+            data["is_first"][:, :context_len]
+        )
+        
+        # Get reconstructions for the context part
+        recon = self.heads["decoder"](spatial_states)['image'].mode()
+        
+        # Get the last state to start imagination from
+        init_state = {k: (v[:, -1] if not isinstance(v, list) else [vi[:, -1] for vi in v]) for k, v in states.items()}
+
+        # Imagine the future
+        prior_states, spatial_priors = self.dynamics.imagine_with_action(data["action"][:, context_len:], init_state)
+        openl = self.heads["decoder"](spatial_priors)['image'].mode()
+
+        # Combine context reconstructions and open-loop predictions
+        model = torch.cat([recon, openl], 1)
+        truth = data["image"]
+        error = (model - truth + 1.0) / 2.0 # Remap error to [0, 1] for visualization
+
+        # Concatenate for side-by-side video comparison
+        video = torch.cat([truth, model, error], 3)
+        return video

@@ -9,7 +9,9 @@ from torch import distributions as torchd
 
 import tools
 
-
+#-----------------------------------------------------------------
+# Original RSSM
+# ----------------------------------------------------------------
 class RSSM(nn.Module):
     def __init__(
         self,
@@ -142,14 +144,20 @@ class RSSM(nn.Module):
         prior = {k: swap(v) for k, v in prior.items()}
         return post, prior
 
+
     def imagine_with_action(self, action, state):
-        swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
-        assert isinstance(state, dict), state
-        action = swap(action)
-        prior = tools.static_scan(self.img_step, [action], state)
-        prior = prior[0]
-        prior = {k: swap(v) for k, v in prior.items()}
-        return prior
+        # action: (B,T,A), state: dict of current posterior (B, ...)
+        swap = lambda x: x.permute([1,0] + list(range(2, x.ndim)))
+        action_T = swap(action)
+
+        def step(prev, a):
+            prior, spatial = self.img_step(prev, a, sample=True)
+            return prior, (prior, spatial)
+
+        (priors_T, spatials_T), _ = tools.static_scan(step, [action_T], state)
+        prior_seq   = {k: (v if not isinstance(v, list) else [swap(x) for x in v]) for k, v in priors_T.items()}
+        spatial_seq = swap(spatials_T[1])  # (B,T,C,H,W)
+        return prior_seq, spatial_seq
 
     def get_feat(self, state):
         stoch = state["stoch"]
@@ -808,3 +816,524 @@ class ImgChLayerNorm(nn.Module):
         x = self.norm(x)
         x = x.permute(0, 3, 1, 2)
         return x
+
+
+#-----------------------------------------------------------------
+# New hRSSM
+# ----------------------------------------------------------------
+class BlockDiagGRUCell(nn.Module):
+    """
+    Block-diagonal GRU cell as provided. Each block will correspond to a
+    level in the hierarchy, allowing for parallel state updates.
+    """
+    def __init__(self, inp_size, size, blocks, norm=True, act=torch.tanh, update_bias=-1):
+        super().__init__()
+        assert size % blocks == 0
+        self.size, self.blocks, self.b = size, blocks, size // blocks
+        self.act, self.update_bias = act, update_bias
+
+        self.Wx = nn.Linear(inp_size, 3*size, bias=False)
+        self.Wrec = nn.Parameter(torch.empty(blocks, self.b, 3*self.b))
+        nn.init.xavier_uniform_(self.Wrec)
+
+        self.ln = nn.LayerNorm(3*size, eps=1e-3) if norm else None
+
+    def forward(self, x, state):
+        h = state[0]
+        N = h.shape[0]
+        hB = h.view(N, self.blocks, self.b)
+
+        parts = self.Wx(x)
+        parts_rec = torch.einsum('nkb,kbc->nkc', hB, self.Wrec).reshape(N, 3*self.size)
+        parts = parts + parts_rec
+        if self.ln is not None:
+            parts = self.ln(parts)
+
+        r, c, z = torch.split(parts, self.size, dim=-1)
+        r = torch.sigmoid(r)
+        c = self.act(r * c)
+        z = torch.sigmoid(z + self.update_bias)
+        h_new = z * c + (1 - z) * h
+        return h_new, [h_new]
+    
+class _ProductDist:
+    """Treats a list of independent distributions as one big factored dist."""
+    def __init__(self, dists):
+        self._dists = dists                      # list length = h_levels
+
+    def log_prob(self, x_list):
+        # x_list is a list with same length as self._dists
+        return sum(d.log_prob(x) for d, x in zip(self._dists, x_list))
+
+    def entropy(self):
+        return sum(d.entropy() for d in self._dists)
+
+    def sample(self):
+        return [d.rsample() if hasattr(d, 'rsample') else d.sample()
+                for d in self._dists]
+
+    def mode(self):
+        return [d.mean if hasattr(d, "mean") else d.mode()
+                for d in self._dists]
+
+
+class hConvEncoder(nn.Module):
+    """
+    Same API as ConvEncoder, but returns a list of feature maps:
+    [stem(H/2), block1(H/4), ..., last(>=minres)] (finest -> coarsest).
+    """
+    def __init__(
+        self,
+        input_shape,
+        depth=32,
+        act="SiLU",
+        norm=True,
+        kernel_size=4,
+        minres=4,
+    ):
+        super().__init__()
+        act = getattr(torch.nn, act)
+        h, w, in_ch = input_shape
+
+        # --- Stem ---
+        stem = [
+            Conv2dSamePad(in_ch, depth, kernel_size=kernel_size, stride=2, bias=False),
+            ImgChLayerNorm(depth) if norm else nn.Identity(),
+            act(),
+        ]
+        self.stem = nn.Sequential(*stem)
+
+        # --- Blocks until >= minres ---
+        self.blocks = nn.ModuleList()
+        in_dim = depth
+        out_dim = depth * 2
+
+        # estimate sizes after the stem first
+        hh, ww = h // 2, w // 2
+        while min(hh, ww) > minres:
+            block = [
+                Conv2dSamePad(in_dim, out_dim, kernel_size=kernel_size, stride=2, bias=False),
+                ImgChLayerNorm(out_dim) if norm else nn.Identity(),
+                act(),
+            ]
+            self.blocks.append(nn.Sequential(*block))
+            in_dim = out_dim
+            out_dim *= 2
+            hh //= 2
+            ww //= 2
+
+        self.apply(tools.weight_init)
+
+    def forward(self, obs):
+        """
+        obs: (batch, time, H, W, C) float in [0,1] (matches ConvEncoder expectation).
+        Returns: list of tensors shaped (batch, time, C, H, W), finest -> coarsest.
+        """
+        # Match ConvEncoder preprocessing but avoid in-place mutation.
+        x = obs - 0.5
+
+        # (B,T,H,W,C) -> (B*T,C,H,W)
+        x = x.reshape((-1,) + tuple(x.shape[-3:]))  # (BT,H,W,C)
+        x = x.permute(0, 3, 1, 2)                   # (BT,C,H,W)
+
+        feats = []
+
+        # Stem (H/2)
+        x = self.stem(x)
+        stem_feat = x.reshape(list(obs.shape[:-3]) + list(x.shape[-3:]))  # (B,T,C,H,W)
+        feats.append(stem_feat)
+
+        # Pyramid blocks (H/4, H/8, ...)
+        for block in self.blocks:
+            x = block(x)
+            f = x.reshape(list(obs.shape[:-3]) + list(x.shape[-3:]))
+            feats.append(f)
+
+        return feats  # finest -> coarsest
+
+class hRSSM(RSSM):
+    """
+    Hierarchical Recurrent State-Space Model.
+    Manages temporal recurrence and the hierarchical generative process.
+    """
+    def __init__(
+        self,
+        h_levels=3,
+        h_stoch_dims=[32, 32, 32],
+        h_deter_dims=[128, 256, 256],
+        h_hidden_dim=200,
+        h_encoder_dims=[128, 256, 128], # Corresponds to hConvEncoder output channels
+        act="SiLU",
+        norm=True,
+        up_mode="nearest",
+        **kwargs
+    ):
+        # We call nn.Module.__init__ directly to bypass RSSM's original __init__
+        nn.Module.__init__(self)
+        
+        # Copy necessary attributes from original RSSM that are still needed
+        self._discrete = kwargs.get('discrete', False)
+        self._unimix_ratio = kwargs.get('unimix_ratio', 0.01)
+        self._initial = kwargs.get('initial', 'learned')
+        self._num_actions = kwargs.get('num_actions')
+        self._device = kwargs.get('device')
+        self._mean_act = kwargs.get('mean_act', 'none')
+        self._std_act = kwargs.get('std_act', 'sigmoid2')
+        self._min_std = kwargs.get('min_std', 0.1)
+
+        # Hierarchical parameters
+        self._h_levels = h_levels
+        self._h_stoch_dims = h_stoch_dims
+        self._h_deter_dims = h_deter_dims
+        self._h_hidden_dim = h_hidden_dim
+        self._h_encoder_dims = h_encoder_dims
+        
+        assert len(self._h_stoch_dims) == self._h_levels
+        assert len(self._h_deter_dims) == self._h_levels
+        assert len(self._h_encoder_dims) == self._h_levels
+
+        self._deter = sum(h_deter_dims)
+        act_fn = getattr(torch.nn, act)
+        
+        # Input layer for GRU
+        inp_dim = sum(self._h_stoch_dims) if not self._discrete else sum(s * d for s, d in zip(self._h_stoch_dims, [self._discrete]*self._h_levels))
+        inp_dim += self._num_actions
+        
+        self._img_in_layers = nn.Sequential(
+            nn.Linear(inp_dim, self._h_hidden_dim, bias=False),
+            nn.LayerNorm(self._h_hidden_dim, eps=1e-03) if norm else nn.Identity(),
+            act_fn()
+        )
+        
+        self._cell = BlockDiagGRUCell(
+            self._h_hidden_dim, self._deter, blocks=self._h_levels, norm=norm, act=torch.tanh
+        )
+
+        # Posterior and Prior networks for each level
+        self.obs_stat_layers = nn.ModuleList()
+        self.imgs_stat_layers = nn.ModuleList()
+        self.expand_modules = nn.ModuleList()
+        
+        # Coarsest level (top of hierarchy)
+        coarsest_embed_dim = self._h_encoder_dims[-1]
+        self.obs_stat_layers.append(self._build_stat_head(self._h_deter_dims[-1] + coarsest_embed_dim, self._h_stoch_dims[-1]))
+        self.imgs_stat_layers.append(self._build_stat_head(self._h_deter_dims[-1], self._h_stoch_dims[-1]))
+        
+        # Finer levels
+        for i in range(self._h_levels - 2, -1, -1):
+            # Input to stat head: deter_l + embed_l + stoch_{l+1}
+            inp_dim = self._h_deter_dims[i] + self._h_encoder_dims[i] + self._h_stoch_dims[i+1]
+            self.obs_stat_layers.insert(0, self._build_stat_head(inp_dim, self._h_stoch_dims[i]))
+            
+            # Input to stat head: deter_l + stoch_{l+1}
+            inp_dim_prior = self._h_deter_dims[i] + self._h_stoch_dims[i+1]
+            self.imgs_stat_layers.insert(0, self._build_stat_head(inp_dim_prior, self._h_stoch_dims[i]))
+
+        if self._initial == "learned":
+            self.W = torch.nn.Parameter(
+                torch.zeros((1, self._deter), device=torch.device(self._device)),
+                requires_grad=True,
+            )
+        
+        self.apply(tools.weight_init)
+        
+        # --------------------------------------------------------------
+        #  Build simple 2× up-sampling modules (coarse ➜ fine, L−2 … 0)
+        # --------------------------------------------------------------
+        self.expand_modules = nn.ModuleList([
+            nn.Upsample(scale_factor=2, mode=up_mode, align_corners=False)
+            for _ in range(self._h_levels - 1)
+        ])
+
+        self.apply(tools.weight_init)
+        print("hRSSM (with expand) initialised.")
+
+    def spatial_channels(self):
+        """
+        Calculate the number of channels in the spatial feature map output.
+        This is the sum of all hierarchical level features after ladder decoding.
+        """
+        # Each level contributes (deter_dim + stoch_dim) channels
+        total_channels = 0
+        for i in range(self._h_levels):
+            level_channels = self._h_deter_dims[i] + self._h_stoch_dims[i]
+            if self._discrete:
+                level_channels = self._h_deter_dims[i] + self._h_stoch_dims[i] * self._discrete
+            total_channels += level_channels
+        return total_channels
+
+    # ---------- helper: build spatial feature map ---------------------
+    def _build_spatial(self, deter_flat, stoch_list):
+        """
+        Ladder-style top-down decoder that turns {deter, stoch} into a
+        spatial tensor ready for the 1×1 RGB head.
+        Output shape:  (B, C_final, 2**(L-1), 2**(L-1))
+        """
+        B = deter_flat.shape[0]
+        deter_split = torch.split(deter_flat, self._h_deter_dims, dim=-1)
+
+        # Start from 1×1 coarse map ϕ_L
+        feat = torch.cat([deter_split[-1], stoch_list[-1]], -1)       # (B, C_L)
+        feat = feat.view(B, -1, 1, 1)                                 # (B, C_L, 1, 1)
+
+        # Walk coarse ➜ fine through expand_modules
+        for l in range(self._h_levels - 2, -1, -1):
+            feat = self.expand_modules[l](feat)                       # 2× upsample
+            add  = torch.cat([deter_split[l], stoch_list[l]], -1)     # inject level-l
+            add  = add.view(B, -1, 1, 1).expand_as(feat)
+            feat = torch.cat([feat, add], 1)                          # channel-concat
+        return feat                                                   # (B, C*, H, W)
+
+    def _build_stat_head(self, inp_dim, stoch_dim):
+        layers = [
+            nn.Linear(inp_dim, self._h_hidden_dim, bias=False),
+            nn.LayerNorm(self._h_hidden_dim, eps=1e-03),
+            getattr(torch.nn, "SiLU")()
+        ]
+        if self._discrete:
+            layers.append(nn.Linear(self._h_hidden_dim, stoch_dim * self._discrete))
+        else:
+            layers.append(nn.Linear(self._h_hidden_dim, 2 * stoch_dim))
+        return nn.Sequential(*layers)
+
+    def initial(self, batch_size):
+        deter = torch.zeros(batch_size, self._deter, device=self._device)
+        if self._initial == "learned":
+            deter = torch.tanh(self.W).repeat(batch_size, 1)
+
+        if self._discrete:
+            state = {
+                'logit': [torch.zeros([batch_size, d, self._discrete], device=self._device) for d in self._h_stoch_dims],
+                'stoch': [torch.zeros([batch_size, d, self._discrete], device=self._device) for d in self._h_stoch_dims],
+                'deter': deter,
+            }
+        else:
+            state = {
+                'mean': [torch.zeros([batch_size, d], device=self._device) for d in self._h_stoch_dims],
+                'std': [torch.ones([batch_size, d], device=self._device) for d in self._h_stoch_dims],
+                'stoch': [torch.zeros([batch_size, d], device=self._device) for d in self._h_stoch_dims],
+                'deter': deter,
+            }
+        return state
+
+
+    # ---------- img_step: now returns (prior, spatial) ----------------
+    def img_step(self, prev_state, prev_action, sample=True):
+        # -- deterministic update --------------------------------
+        prev_stoch_flat = torch.cat(prev_state['stoch'], -1)
+        x = torch.cat([prev_stoch_flat, prev_action], -1)
+        x = self._img_in_layers(x)
+        deter, _ = self._cell(x, [prev_state['deter']])
+        deter = deter[0]
+
+        # -- ladder prior ----------------------------------------
+        prior_stoch, prior_stats = [], {'mean': [], 'std': [], 'logit': []} \
+            if not self._discrete else {'logit': [], 'stoch': []}
+
+        deter_coarse = torch.split(deter, self._h_deter_dims, dim=-1)[-1]
+        stats = self._suff_stats_layer_h(self.imgs_stat_layers[-1],
+                                         deter_coarse, self._h_stoch_dims[-1])
+        z = self.get_dist_h(stats).sample() if sample else self.get_dist_h(stats).mode()
+        prior_stoch.append(z)
+        for k, v in stats.items(): prior_stats[k].append(v)
+
+        for i in range(self._h_levels - 2, -1, -1):
+            deter_l = torch.split(deter, self._h_deter_dims, dim=-1)[i]
+            x = torch.cat([deter_l, prior_stoch[-1]], -1)
+            stats = self._suff_stats_layer_h(self.imgs_stat_layers[i],
+                                             x, self._h_stoch_dims[i])
+            z = self.get_dist_h(stats).sample() if sample else self.get_dist_h(stats).mode()
+            prior_stoch.insert(0, z)
+            for k, v in stats.items(): prior_stats[k].insert(0, v)
+
+        prior = {'stoch': prior_stoch, 'deter': deter, **prior_stats}
+
+        # -------- spatial feature map --------------------------------
+        spatial = self._build_spatial(deter, prior_stoch)             # (B, C, H, W)
+        return prior, spatial                                         # (prior, spatial)
+
+    # ---------- obs_step: identical but now builds spatial -------------
+    def obs_step(self, prev_state, prev_action, embed_list, is_first, sample=True):
+        # Handle episode starts
+        if prev_state is None or torch.sum(is_first) == len(is_first):
+            prev_state = self.initial(len(is_first))
+            prev_action = torch.zeros((len(is_first), self._num_actions), device=self._device)
+        elif torch.sum(is_first) > 0:
+            # Mask out state and action for new episodes
+            is_first = is_first.unsqueeze(-1)
+            prev_action *= (1.0 - is_first)
+            init_state = self.initial(len(is_first))
+            for key, val in prev_state.items():
+                if isinstance(val, list):
+                    for i in range(len(val)):
+                        prev_state[key][i] *= (1.0 - is_first)
+                        prev_state[key][i] += (init_state[key][i] * is_first)
+                else:
+                    prev_state[key] *= (1.0 - is_first)
+                    prev_state[key] += (init_state[key] * is_first)
+        
+        # Get prior
+        prior, _ = self.img_step(prev_state, prev_action, sample=sample)
+        
+        # Compute posterior
+        post_stoch = []
+        post_stats = {'mean': [], 'std': [], 'logit': []} if not self._discrete else {'logit': [], 'stoch': []}
+        
+        # Coarsest level
+        deter_coarse = torch.split(prior['deter'], self._h_deter_dims, dim=-1)[-1]
+        embed_coarse = embed_list[-1].reshape(embed_list[-1].shape[0], -1)
+        x = torch.cat([deter_coarse, embed_coarse], -1)
+        stats = self._suff_stats_layer_h(self.obs_stat_layers[-1], x, self._h_stoch_dims[-1])
+        stoch = self.get_dist_h(stats).sample() if sample else self.get_dist_h(stats).mode()
+        post_stoch.append(stoch)
+        for k, v in stats.items(): post_stats[k].append(v)
+        
+        # Finer levels (top-down)
+        for i in range(self._h_levels - 2, -1, -1):
+            deter_l = torch.split(prior['deter'], self._h_deter_dims, dim=-1)[i]
+            embed_l = embed_list[i].reshape(embed_list[i].shape[0], -1)
+            # Condition on coarser stochastic state
+            x = torch.cat([deter_l, embed_l, post_stoch[-1]], -1)
+            stats = self._suff_stats_layer_h(self.obs_stat_layers[i], x, self._h_stoch_dims[i])
+            stoch = self.get_dist_h(stats).sample() if sample else self.get_dist_h(stats).mode()
+            post_stoch.insert(0, stoch) # Prepend to maintain order
+            for k, v in stats.items(): post_stats[k].insert(0, v)
+
+        post = {'stoch': post_stoch, 'deter': prior['deter'], **post_stats}
+        spatial_post = self._build_spatial(prior['deter'], post_stoch) 
+        return post, prior, spatial_post
+
+    def observe(self, embed_list, action, is_first, state=None):
+        # time-major swap for each level
+        swap = lambda x: x.permute([1, 0] + list(range(2, x.ndim)))
+        embed_list_T = [swap(e) for e in embed_list]
+        action_T, is_first_T = swap(action), swap(is_first)
+
+        def step(prev, a, embeds, first):
+            post, spatial = self.obs_step(prev[0], a, embeds, first, sample=True)
+            # we also need the prior for KL; recompute it deterministically from the same prev state & action
+            prior, _ = self.img_step(prev[0], a, sample=True)
+            return (post, prior, spatial), (post, prior)
+
+        (post_seq, prior_seq, spatial_seq), _ = tools.static_scan(
+            step, (action_T, list(zip(*embed_list_T)), is_first_T), (state, state)
+        )
+
+        unswap = lambda t: t.permute([1, 0] + list(range(2, t.ndim)))
+        # batch-major
+        post_seq  = {k: (v if not isinstance(v, list) else [unswap(x) for x in v]) for k, v in post_seq.items()}
+        prior_seq = {k: (v if not isinstance(v, list) else [unswap(x) for x in v]) for k, v in prior_seq.items()}
+        spatial_seq = unswap(spatial_seq)  # (B,T,C,H,W)
+        return post_seq, prior_seq, spatial_seq
+    
+    # ------------------------------------------------------------------
+    #   Imagination rollout (open-loop): given an initial posterior
+    #   `state` and a sequence of future actions, predict priors and
+    #   their spatial maps for every step.
+    #   Returns:
+    #       prior_seq   – dict with same keys as a single prior, each
+    #                     value shaped (B, T, …)
+    #       spatial_seq – tensor (B, T, C, H, W)
+    # ------------------------------------------------------------------
+    def imagine_with_action(self, action, state, sample=True):
+        """
+        action : (B, T, act_dim)
+        state  : hierarchical posterior at time 0  (B, ...)
+        """
+        swap = lambda x: x.permute([1, 0] + list(range(2, x.ndim)))   # B,T → T,B
+        action_T = swap(action)                                       # (T,B,act)
+
+        # one scan step ----------------------------------------------------------------
+        def step(prev_state, act_t):
+            prior_t, spatial_t = self.img_step(prev_state, act_t, sample=sample)
+            return prior_t, (prior_t, spatial_t)
+
+        # run the GRU / ladder forward --------------------------------------------------
+        (priors_T, spatials_T), _ = tools.static_scan(
+            step, [action_T], state
+        )  # priors_T is a dict with time major tensors; spatials_T is (T,B,C,H,W)
+
+        # time-major → batch-major ------------------------------------------------------
+        unswap = lambda t: t.permute([1, 0] + list(range(2, t.ndim)))  # T,B → B,T
+        prior_seq = {
+            k: (v if not isinstance(v, list)
+                else [unswap(x) for x in v])        # lists (one per level)
+            for k, v in priors_T.items()
+        }
+        spatial_seq = unswap(spatials_T)            # (B,T,C,H,W)
+
+        return prior_seq, spatial_seq
+
+    def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
+        kld = torchd.kl.kl_divergence
+        sg = lambda x: {k: v.detach() if isinstance(v, torch.Tensor) else [vi.detach() for vi in v] for k, v in x.items()}
+
+        dyn_loss_list, rep_loss_list, kl_value_list = [], [], []
+
+        for i in range(self._h_levels):
+            post_dist = self.get_dist_h({k: v[i] for k, v in post.items()})
+            prior_dist = self.get_dist_h({k: v[i] for k, v in prior.items()})
+            prior_dist_sg = self.get_dist_h({k: v[i] for k, v in sg(prior).items()})
+            post_dist_sg = self.get_dist_h({k: v[i] for k, v in sg(post).items()})
+            
+            dyn_loss_list.append(kld(post_dist_sg, prior_dist))
+            rep_loss_list.append(kld(post_dist, prior_dist_sg))
+            kl_value_list.append(kld(post_dist, prior_dist))
+        
+        dyn_loss = torch.stack(dyn_loss_list).sum(0)
+        rep_loss = torch.stack(rep_loss_list).sum(0)
+        kl_value = torch.stack(kl_value_list).sum(0)
+
+        dyn_loss = torch.clip(dyn_loss, min=free)
+        rep_loss = torch.clip(rep_loss, min=free)
+        
+        loss = dyn_scale * dyn_loss + rep_scale * rep_loss
+        return loss, kl_value, dyn_loss, rep_loss
+
+    def get_feat(self, state, levels='all'):
+        if levels == 'all':
+            stoch_flat = torch.cat(state['stoch'], -1)
+            return torch.cat([stoch_flat, state['deter']], -1)
+        elif levels == 'top':
+            return torch.cat([state['stoch'][-1], torch.split(state['deter'], self._h_deter_dims, dim=-1)[-1]], -1)
+        else: # Assume integer index
+            level_idx = int(levels)
+            return torch.cat([state['stoch'][level_idx], torch.split(state['deter'], self._h_deter_dims, dim=-1)[level_idx]], -1)
+    
+    def get_dist_h(self, state_level):
+        if self._discrete:
+            logit = state_level["logit"]
+            return tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio)
+        else:
+            mean, std = state_level["mean"], state_level["std"]
+            return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(mean, std), 1))
+    
+    def get_dist(self, full_state):
+        """
+        full_state is the usual dict {'stoch':[z1,…,zL], 'mean':[…], …}
+        Returns a _ProductDist so existing Dreamer code keeps working.
+        """
+        dists = [self.get_dist_h({k: (v[i] if isinstance(v, list) else v)
+                                for k, v in full_state.items()})
+                for i in range(self._h_levels)]
+        return _ProductDist(dists)
+
+    def _suff_stats_layer_h(self, layer, x, stoch_dim):
+        stats = layer(x)
+        if self._discrete:
+            logit = stats.reshape(list(x.shape[:-1]) + [stoch_dim, self._discrete])
+            return {"logit": logit}
+        else:
+            mean, std = torch.split(stats, [stoch_dim] * 2, -1)
+            mean = {
+                "none": lambda: mean,
+                "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
+            }[self._mean_act]()
+            std = {
+                "softplus": lambda: torch.softplus(std),
+                "abs": lambda: torch.abs(std + 1),
+                "sigmoid": lambda: torch.sigmoid(std),
+                "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
+            }[self._std_act]()
+            std = std + self._min_std
+            return {"mean": mean, "std": std}

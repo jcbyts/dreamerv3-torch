@@ -7,6 +7,7 @@ import pathlib
 import re
 import time
 import random
+import math
 
 import numpy as np
 
@@ -33,6 +34,226 @@ def symlog(x):
 
 def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+
+# -----------------------------------------------------------------------------#
+# Hierarchical VAE Utilities
+# -----------------------------------------------------------------------------#
+
+def split_stoch(total: int, levels: int):
+    """
+    Split total stochastic size across ladder levels.
+
+    Args:
+        total: Total stochastic size (cfg.stoch)
+        levels: Number of ladder levels (cfg.ladder_levels)
+
+    Returns:
+        List of block sizes, with last level absorbing remainder
+
+    Example:
+        split_stoch(32, 3) -> [11, 11, 10]
+        split_stoch(32, 4) -> [8, 8, 8, 8]
+        split_stoch(30, 4) -> [8, 8, 8, 6]
+    """
+    if levels <= 0:
+        raise ValueError(f"levels must be positive, got {levels}")
+    if total <= 0:
+        raise ValueError(f"total must be positive, got {total}")
+
+    per = math.ceil(total / levels)
+    parts = [per] * (levels - 1) + [total - per * (levels - 1)]
+
+    # Ensure last part is positive
+    if parts[-1] <= 0:
+        raise ValueError(
+            f"Invalid split: total={total}, levels={levels} results in "
+            f"non-positive last block size {parts[-1]}"
+        )
+
+    assert sum(parts) == total, f"Split {parts} doesn't sum to {total}"
+    return parts
+
+
+def merge_blocks(post_list, deter_state):
+    """
+    Merge hierarchical posterior list back to single tensor format.
+
+    Args:
+        post_list: List of per-level posterior dicts with 'mean', 'std', etc.
+        deter_state: Deterministic state tensor to preserve
+
+    Returns:
+        Single posterior dict compatible with decoder/actor
+    """
+    if not post_list:
+        raise ValueError("post_list cannot be empty")
+
+    # Extract stochastic parts and concatenate
+    stoch_parts = []
+    for post in post_list:
+        if 'stoch' in post:
+            stoch_parts.append(post['stoch'])
+        elif 'mean' in post:
+            # Sample from distribution if needed
+            dist = get_dist(post)
+            stoch_parts.append(dist.sample())
+        elif 'logit' in post:
+            # Sample from discrete distribution
+            dist = get_dist(post)
+            stoch_parts.append(dist.sample())
+        else:
+            raise ValueError(f"Post dict missing 'stoch', 'mean', or 'logit': {post.keys()}")
+
+    # Concatenate along stoch dimension (dim=1 for discrete, dim=-1 for continuous)
+    if len(stoch_parts[0].shape) == 3:  # Discrete: (batch, stoch, discrete)
+        merged_stoch = torch.cat(stoch_parts, dim=1)
+    else:  # Continuous: (batch, stoch)
+        merged_stoch = torch.cat(stoch_parts, dim=-1)
+
+    # Create merged posterior dict
+    merged_post = {
+        'stoch': merged_stoch,
+        'deter': deter_state,
+    }
+
+    # Preserve other keys from first level (like logits for discrete)
+    for key, value in post_list[0].items():
+        if key not in ['stoch', 'deter', 'mean', 'std']:
+            # Concatenate if it's a tensor with stoch dimension
+            if isinstance(value, torch.Tensor) and value.shape[-1] > 1:
+                merged_values = [post.get(key, value) for post in post_list]
+                merged_post[key] = torch.cat(merged_values, dim=-1)
+            else:
+                merged_post[key] = value
+
+    return merged_post
+
+
+def get_dist(stats):
+    """
+    Helper to create distribution from stats dict.
+    Compatible with both discrete and continuous RSSM.
+    """
+    if 'logit' in stats:
+        # Discrete case (RSSM uses 'logit', not 'logits')
+        return torch.distributions.OneHotCategorical(logits=stats['logit'])
+    elif 'logits' in stats:
+        # Alternative discrete case
+        return torch.distributions.OneHotCategorical(logits=stats['logits'])
+    elif 'mean' in stats and 'std' in stats:
+        # Continuous case
+        return torch.distributions.Normal(stats['mean'], stats['std'])
+    else:
+        raise ValueError(f"Unknown stats format: {stats.keys()}")
+
+
+def validate_block_alignment(stoch_size, levels, discrete_num=None):
+    """
+    Validate that stochastic size can be properly split across levels.
+
+    Args:
+        stoch_size: Total stochastic size
+        levels: Number of ladder levels
+        discrete_num: Number of discrete categories (if using discrete RSSM)
+
+    Raises:
+        ValueError: If configuration is invalid
+    """
+    if levels <= 0:
+        raise ValueError(f"levels must be positive, got {levels}")
+
+    parts = split_stoch(stoch_size, levels)
+
+    # Check minimum block size
+    min_block = min(parts)
+    if min_block < 1:
+        raise ValueError(
+            f"Block size too small: {min_block}. "
+            f"Reduce levels or increase stoch_size."
+        )
+
+    # For discrete RSSM, check that each block can hold at least one category
+    if discrete_num is not None:
+        for i, block_size in enumerate(parts):
+            if block_size < 1:
+                raise ValueError(
+                    f"Level {i} block size {block_size} too small for discrete RSSM"
+                )
+
+    return parts
+
+
+def fuse_prior(prior_stats, delta_stats, mode="gauss"):
+    """
+    Fuse RSSM prior with encoder delta using residual parameterization.
+
+    Implements the CNVAE-style residual posterior:
+    q(z|x) = Prior(μ_p, σ_p) × Deviation(δμ, δlogσ)
+
+    Args:
+        prior_stats: Dict with prior parameters from RSSM
+                    - For continuous: {"mean": μ_p, "std": σ_p}
+                    - For discrete: {"logit": logit_p}
+        delta_stats: Tensor with encoder residuals
+                    - For continuous: (B, 2*dim) → [δμ, δlogσ]
+                    - For discrete: (B, dim, K) → δlogit
+        mode: "gauss" for continuous, "discrete" for categorical
+
+    Returns:
+        Dict with fused posterior parameters
+    """
+    if mode == "gauss":
+        # Continuous case: μ = μ_p + δμ, σ = softplus(log(σ_p) + δlogσ)
+        μ_p = prior_stats["mean"]
+        σ_p = prior_stats["std"]
+
+        # Split delta into mean and log-std residuals
+        δμ, δlogσ = torch.chunk(delta_stats, 2, dim=-1)
+
+        # Residual fusion
+        μ = μ_p + δμ                                    # Additive mean residual
+        σ = F.softplus(torch.log(σ_p + 1e-8) + δlogσ)  # Multiplicative std residual
+
+        # Preserve other keys from prior
+        result = {**prior_stats, "mean": μ, "std": σ}
+        return result
+
+    elif mode == "discrete":
+        # Discrete case: logit = logit_p + δlogit
+        logit_p = prior_stats["logit"]
+        δlogit = delta_stats
+
+        # Residual fusion
+        logit = logit_p + δlogit                        # Additive logit residual
+
+        # Preserve other keys from prior
+        result = {**prior_stats, "logit": logit}
+        return result
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Use 'gauss' or 'discrete'.")
+
+
+def sample_hierarchical(post_list, rssm):
+    """
+    Sample stochastic states from hierarchical posterior list.
+
+    Args:
+        post_list: List of per-level posterior dicts
+        rssm: RSSM instance for distribution creation
+
+    Returns:
+        List of sampled states (one per level)
+    """
+    sampled_list = []
+    for post in post_list:
+        dist = rssm.get_dist(post)
+        stoch = dist.sample()
+        sampled_post = {**post, "stoch": stoch}
+        sampled_list.append(sampled_post)
+
+    return sampled_list
 
 
 class RequiresGrad:
