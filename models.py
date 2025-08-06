@@ -35,7 +35,9 @@ class WorldModel(nn.Module):
     def __init__(self, obs_space, act_space, step, config):
         super(WorldModel, self).__init__()
         self._step = step
-        self._use_amp = True if config.precision == 16 else False
+        self._use_amp = True if config.precision != 32 else False
+        self._amp_dtype = torch.bfloat16 if config.precision == 'bfloat16' else torch.float16
+
         self._config = config
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
@@ -220,7 +222,10 @@ class WorldModel(nn.Module):
 class ImagBehavior(nn.Module):
     def __init__(self, config, world_model):
         super(ImagBehavior, self).__init__()
-        self._use_amp = True if config.precision == 16 else False
+
+        self._use_amp = True if config.precision != 32 else False
+        self._amp_dtype = torch.bfloat16 if config.precision == 'bfloat16' else torch.float16
+
         self._config = config
         self._world_model = world_model
         
@@ -316,7 +321,9 @@ class ImagBehavior(nn.Module):
                     weights,
                     base,
                 )
-                actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
+                # actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
+                actor_loss = actor_loss - self._config.actor["entropy"] * actor_ent[:-1, ..., None]
+
                 actor_loss = torch.mean(actor_loss)
                 metrics.update(mets)
                 value_input = imag_feat
@@ -329,7 +336,8 @@ class ImagBehavior(nn.Module):
                 value_loss = -value.log_prob(target.detach())
                 slow_target = self._slow_value(value_input[:-1].detach())
                 if self._config.critic["slow_target"]:
-                    value_loss -= value.log_prob(slow_target.mode().detach())
+                    # value_loss -= value.log_prob(slow_target.mode().detach())
+                    value_loss = value_loss - slow_target.log_prob(value.mode().detach())
                 # (time, batch, 1), (time, batch, 1) -> (1,)
                 value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
@@ -350,10 +358,16 @@ class ImagBehavior(nn.Module):
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
         return imag_feat, imag_state, imag_action, weights, metrics
 
+
     def _imagine(self, start, policy, horizon):
         dynamics = self._world_model.dynamics
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-        start = {k: flatten(v) for k, v in start.items()}
+        
+        # handle both hierarchical and flat latents
+        start = {
+            k: [flatten(x) for x in v] if isinstance(v, list) else flatten(v)
+            for k, v in start.items()
+        }
 
         def step(prev, _):
             state, _, _ = prev
@@ -361,12 +375,30 @@ class ImagBehavior(nn.Module):
             inp = feat.detach()
             action = policy(inp).sample()
             succ = dynamics.img_step(state, action)
-            return succ, feat, action
+            if isinstance(succ, tuple):
+                succ = succ[0] # hRSSM returns a tuple of (prior, spatial)
+            
+            succ_detached = {k: [item.detach() for item in v] if isinstance(v, list) else v.detach() for k, v in succ.items()}
+            
+            return succ_detached, feat, action
 
         succ, feats, actions = tools.static_scan(
             step, [torch.arange(horizon)], (start, None, None)
         )
-        states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
+        # states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()} # old flat RSSM only version
+        states = {}
+        for k, v_seq in succ.items():
+            if isinstance(v_seq, list):
+                # Hierarchical case for keys like 'stoch', 'logit', etc.
+                # start[k] is a list of tensors for each level.
+                # v_seq is also a list of tensors for each level.
+                states[k] = [
+                    torch.cat([start_tensor[None], seq_tensor[:-1]], 0)
+                    for start_tensor, seq_tensor in zip(start[k], v_seq)
+                ]
+            else:
+                # Flat case for 'deter'.
+                states[k] = torch.cat([start[k][None], v_seq[:-1]], 0)
 
         return feats, states, actions
 
@@ -432,12 +464,20 @@ class ImagBehavior(nn.Module):
         actor_loss = -weights[:-1] * actor_target
         return actor_loss, metrics
 
+    # def _update_slow_target(self): # potential in place bug
+    #     if self._config.critic["slow_target"]:
+    #         if self._updates % self._config.critic["slow_target_update"] == 0:
+    #             mix = self._config.critic["slow_target_fraction"]
+    #             for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
+    #                 d.data = mix * s.data + (1 - mix) * d.data
+    #         self._updates += 1
     def _update_slow_target(self):
         if self._config.critic["slow_target"]:
             if self._updates % self._config.critic["slow_target_update"] == 0:
                 mix = self._config.critic["slow_target_fraction"]
-                for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
-                    d.data = mix * s.data + (1 - mix) * d.data
+                with torch.no_grad():
+                    for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
+                        d.copy_(mix * s + (1 - mix) * d)
             self._updates += 1
 
 
@@ -493,7 +533,9 @@ class hWorldModel(WorldModel):
     def __init__(self, obs_space, act_space, step, config):
         super(WorldModel, self).__init__()
         self._step = step
-        self._use_amp = True if config.precision == 16 else False
+        self._use_amp = True if config.precision != 32 else False
+        self._amp_dtype = torch.bfloat16 if config.precision == 'bfloat16' else torch.float16
+
         self._config = config
         
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}

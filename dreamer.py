@@ -245,7 +245,7 @@ def main(config):
         tools.enable_deterministic_run()
 
     # Disable anomaly detection for performance
-    # torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(True)
 
     # Auto-generate logdir if not specified or if it's a default model logdir
     if (config.logdir is None or

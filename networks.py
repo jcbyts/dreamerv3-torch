@@ -144,20 +144,14 @@ class RSSM(nn.Module):
         prior = {k: swap(v) for k, v in prior.items()}
         return post, prior
 
-
     def imagine_with_action(self, action, state):
-        # action: (B,T,A), state: dict of current posterior (B, ...)
-        swap = lambda x: x.permute([1,0] + list(range(2, x.ndim)))
-        action_T = swap(action)
-
-        def step(prev, a):
-            prior, spatial = self.img_step(prev, a, sample=True)
-            return prior, (prior, spatial)
-
-        (priors_T, spatials_T), _ = tools.static_scan(step, [action_T], state)
-        prior_seq   = {k: (v if not isinstance(v, list) else [swap(x) for x in v]) for k, v in priors_T.items()}
-        spatial_seq = swap(spatials_T[1])  # (B,T,C,H,W)
-        return prior_seq, spatial_seq
+        swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        assert isinstance(state, dict), state
+        action = swap(action)
+        prior = tools.static_scan(self.img_step, [action], state)
+        prior = prior[0]
+        prior = {k: swap(v) for k, v in prior.items()}
+        return prior
 
     def get_feat(self, state):
         stoch = state["stoch"]
@@ -837,7 +831,8 @@ class BlockDiagGRUCell(nn.Module):
         nn.init.xavier_uniform_(self.Wrec)
 
         self.ln = nn.LayerNorm(3*size, eps=1e-3) if norm else None
-
+    
+    
     def forward(self, x, state):
         h = state[0]
         N = h.shape[0]
@@ -855,6 +850,30 @@ class BlockDiagGRUCell(nn.Module):
         z = torch.sigmoid(z + self.update_bias)
         h_new = z * c + (1 - z) * h
         return h_new, [h_new]
+    
+    # def forward(self, x, state):# NEW
+    #     h = state[0]
+    #     N = h.shape[0]
+    #     hB = h.view(N, self.blocks, self.b)
+
+    #     parts = self.Wx(x)
+    #     parts_rec = torch.einsum('nkb,kbc->nkc', hB, self.Wrec).reshape(N, 3*self.size)
+    #     parts = parts + parts_rec
+    #     if self.ln is not None:
+    #         parts = self.ln(parts)
+
+    #     r, c, z = torch.split(parts, self.size, dim=-1)
+    #     r = torch.sigmoid(r)
+    #     c = self.act(r * c)
+    #     z = torch.sigmoid(z + self.update_bias)
+
+    #     # Original line:
+    #     # h_new = z * c + (1 - z) * h
+        
+    #     # Corrected, explicitly safe line:
+    #     h_new = z * c + (1 - z) * h.clone()
+
+    #     return h_new, [h_new]
     
 class _ProductDist:
     """Treats a list of independent distributions as one big factored dist."""
@@ -1246,7 +1265,11 @@ class hRSSM(RSSM):
         return total_channels
     
     def _flat_z(self, z):
-        return z.flatten(start_dim=1) if self._discrete and z.ndim == 3 else z
+        if self._discrete and z.ndim >= 3:
+            # Generalize flattening for tensors of 3D (B, S, D) or 4D (B, T, S, D)
+            # This reshapes the last two dimensions (stochastic and discrete) into one.
+            return z.reshape(*z.shape[:-2], -1)
+        return z
     
     def initial(self, batch_size):
         deter = torch.zeros(batch_size, self._deter, device=self._device)
@@ -1370,6 +1393,24 @@ class hRSSM(RSSM):
         if prev_state is None or torch.all(is_first):
             prev_state = self.initial(B)
             prev_action = torch.zeros(B, self._num_actions, device=self._device)
+
+        # elif torch.sum(is_first) > 0:
+        #     # *** START FIX ***
+        #     # Do NOT modify prev_state in-place. Create a new state dictionary.
+        #     new_state = {}
+        #     is_first_r_action = is_first[:, None]
+        #     # prev_action *= 1.0 - is_first_r_action
+        #     prev_action = prev_action * (1.0 - is_first_r_action)
+        #     init_state = self.initial(len(is_first))
+
+        #     for key, val in prev_state.items():
+        #         is_first_r = torch.reshape(
+        #             is_first,
+        #             is_first.shape + (1,) * (len(val.shape) - len(is_first.shape)),
+        #         )
+        #         new_state[key] = val * (1.0 - is_first_r) + init_state[key] * is_first_r
+        #     prev_state = new_state
+
         elif torch.any(is_first):
             
             prev_action_mask = (1 - is_first).float().unsqueeze(-1)
@@ -1499,6 +1540,19 @@ class hRSSM(RSSM):
         spatial_seq = unswap(spatial_seq_T)
         return post_seq, prior_seq, spatial_seq
     
+    # def imagine_with_action(self, action, state):
+    #     # action: (B,T,A), state: dict of current posterior (B, ...)
+    #     swap = lambda x: x.permute([1,0] + list(range(2, x.ndim)))
+    #     action_T = swap(action)
+
+    #     def step(prev, a):
+    #         prio, spatial = self.img_step(prev, a, sample=True)
+    #         return prior, (prior, spatial)
+
+    #     (priors_T, spatials_T), _ = tools.static_scan(step, [action_T], state)
+    #     prior_seq   = {k: (v if not isinstance(v, list) else [swap(x) for x in v]) for k, v in priors_T.items()}
+    #     spatial_seq = swap(spatials_T[1])  # (B,T,C,H,W)
+    #     return prior_seq, spatial_seq
     def imagine_with_action(self, action, state, sample=True):
         swap = lambda x: x.permute([1, 0] + list(range(2, x.ndim)))
         action_T = swap(action)
