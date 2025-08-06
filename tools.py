@@ -302,7 +302,7 @@ class WandbLogger:
             dir=str(logdir),
             config=config,
             resume="allow",
-            id=f"run_{logdir.name}",  # Use logdir name as run ID for resuming
+            id=logdir.name,  # Use logdir name directly (e.g., "hdreamer_vizdoom_deadly_corridor_seed_777")
         )
 
         # Also keep tensorboard for backward compatibility if needed
@@ -1339,8 +1339,10 @@ def weight_init(m):
         if hasattr(m.bias, "data"):
             m.bias.data.fill_(0.0)
     elif isinstance(m, nn.LayerNorm):
-        m.weight.data.fill_(1.0)
-        if hasattr(m.bias, "data"):
+        # Handle both affine and non-affine LayerNorm
+        if hasattr(m, 'weight') and m.weight is not None:
+            m.weight.data.fill_(1.0)
+        if hasattr(m, 'bias') and m.bias is not None:
             m.bias.data.fill_(0.0)
 
 

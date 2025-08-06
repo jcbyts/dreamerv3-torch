@@ -803,10 +803,12 @@ class Conv2dSamePad(torch.nn.Conv2d):
 class ImgChLayerNorm(nn.Module):
     def __init__(self, ch, eps=1e-03):
         super(ImgChLayerNorm, self).__init__()
-        self.norm = torch.nn.LayerNorm(ch, eps=eps)
+        # Use stateless LayerNorm (no learnable affine parameters) to avoid sharing issues
+        self.norm = torch.nn.LayerNorm(ch, eps=eps, elementwise_affine=False)
 
     def forward(self, x):
         x = x.permute(0, 2, 3, 1)
+        # Use stateless LayerNorm (no learnable parameters to share)
         x = self.norm(x)
         x = x.permute(0, 3, 1, 2)
         return x
@@ -830,7 +832,8 @@ class BlockDiagGRUCell(nn.Module):
         self.Wrec = nn.Parameter(torch.empty(blocks, self.b, 3*self.b))
         nn.init.xavier_uniform_(self.Wrec)
 
-        self.ln = nn.LayerNorm(3*size, eps=1e-3) if norm else None
+        # Use stateless LayerNorm (no learnable affine parameters) to avoid sharing issues
+        self.ln = nn.LayerNorm(3*size, eps=1e-3, elementwise_affine=False) if norm else None
     
     
     def forward(self, x, state):
@@ -842,6 +845,7 @@ class BlockDiagGRUCell(nn.Module):
         parts_rec = torch.einsum('nkb,kbc->nkc', hB, self.Wrec).reshape(N, 3*self.size)
         parts = parts + parts_rec
         if self.ln is not None:
+            # Use stateless LayerNorm (no learnable parameters to share)
             parts = self.ln(parts)
 
         r, c, z = torch.split(parts, self.size, dim=-1)
@@ -1162,11 +1166,10 @@ class hRSSM(RSSM):
             inp_dim = sum(self._h_stoch_dims)
         inp_dim += self._num_actions
 
-        self._img_in_layers = nn.Sequential(
-            nn.Linear(inp_dim, self._h_hidden_dim, bias=False),
-            nn.LayerNorm(self._h_hidden_dim, eps=1e-3) if norm else nn.Identity(),
-            act_fn(),
-        )
+        # Create separate components with stateless LayerNorm to avoid sharing issues
+        self._img_in_linear = nn.Linear(inp_dim, self._h_hidden_dim, bias=False)
+        self._img_in_norm = nn.LayerNorm(self._h_hidden_dim, eps=1e-3, elementwise_affine=False) if norm else None
+        self._img_in_act = act_fn()
 
         # Block-diagonal GRU (deterministic state)
         self._cell = BlockDiagGRUCell(
@@ -1305,7 +1308,11 @@ class hRSSM(RSSM):
         stoch_list_flat = [self._flat_z(s) for s in prev_state["stoch"]]  # list of (B, s*K) or (B,s)
         prev_stoch_flat = torch.cat(stoch_list_flat, dim=1)               # (B, sum s*K) or (B,sum s)
         x = torch.cat([prev_stoch_flat, prev_action], dim=-1)
-        x = self._img_in_layers(x)
+        # Custom forward with stateless LayerNorm (no learnable parameters to share)
+        x = self._img_in_linear(x)
+        if self._img_in_norm is not None:
+            x = self._img_in_norm(x)
+        x = self._img_in_act(x)
         deter, _ = self._cell(x, [prev_state["deter"]])                   # (B, sum deter)
         deter_split = torch.split(deter, self._h_deter_dims, dim=-1)      # list l=0..L-1 finest->coarsest
 

@@ -76,11 +76,39 @@ class Dreamer(nn.Module):
                 if self._should_pretrain()
                 else self._should_train(step)
             )
-            for _ in range(steps):
+            for i in range(steps):
                 self._train(next(self._dataset))
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
-            if self._should_log(step):
+
+                # Update logger step for each training step
+                self._logger.step = self._step * self._config.action_repeat + i
+
+                # Log every 100 training steps for immediate feedback
+                if (self._update_count % 100) == 0:
+                    # Log key metrics immediately for monitoring
+                    key_metrics = {}
+                    for name in ["model_loss", "actor_loss", "value_loss", "kl", "actor_entropy"]:
+                        if name in self._metrics and self._metrics[name]:
+                            key_metrics[name] = float(np.mean(self._metrics[name]))
+
+                    if key_metrics:
+                        # Log to wandb immediately for monitoring
+                        for name, value in key_metrics.items():
+                            self._logger.scalar(f"immediate/{name}", value)
+                        self._logger.write(fps=False, step=self._logger.step)
+
+        policy_output, state = self._policy(obs, state, training)
+
+        if training:
+            self._step += len(reset)
+            self._logger.step = self._config.action_repeat * self._step
+
+            # Check for main logging AFTER step increment
+            should_log_result = self._should_log(self._step)
+            if should_log_result:
+                print(f"[LOGGING] Step {self._step}, should_log returned {should_log_result}, update_count {self._update_count}")
+
                 for name, values in self._metrics.items():
                     self._logger.scalar(name, float(np.mean(values)))
                     self._metrics[name] = []
@@ -92,12 +120,9 @@ class Dreamer(nn.Module):
                 # (Can be re-enabled later if needed)
 
                 self._logger.write(fps=True)
+            elif (self._step % 100) == 0:  # Debug every 100 steps
+                print(f"[DEBUG] Step {self._step}, should_log returned {should_log_result}, update_count {self._update_count}, log_every {self._config.log_every}")
 
-        policy_output, state = self._policy(obs, state, training)
-
-        if training:
-            self._step += len(reset)
-            self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
     def _policy(self, obs, state, training):
@@ -106,9 +131,6 @@ class Dreamer(nn.Module):
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
-        # DEBUGGING LINES
-        # print(f"obs keys: {obs.keys()}")
-        # print(f"obs image shape: {obs['image'].shape}")
         embed = self._wm.encoder(obs)
 
         obs_out = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
@@ -249,7 +271,7 @@ def main(config):
 
     # Auto-generate logdir if not specified or if it's a default model logdir
     if (config.logdir is None or
-        config.logdir in ['./logdir/dreamer', './logdir/pdreamer', './logdir/hidreamer']):
+        config.logdir in ['./logdir/dreamer', './logdir/pdreamer', './logdir/hdreamer']):
 
         # Determine model name from config names used
         config_names = getattr(config, '_config_names', [])
@@ -257,7 +279,7 @@ def main(config):
 
         # Check for explicit model configs first
         for name in config_names:
-            if name in ['dreamer', 'pdreamer', 'hidreamer']:
+            if name in ['dreamer', 'pdreamer', 'hdreamer']:  # Fixed: hdreamer not hidreamer
                 model_name = name
                 break
 
@@ -266,7 +288,7 @@ def main(config):
             if getattr(config, 'use_cnvae', False) and getattr(config, 'use_poisson', False):
                 model_name = "cnvae_pdreamer"
             elif getattr(config, 'use_cnvae', False):
-                model_name = "hidreamer"
+                model_name = "hdreamer"  # Fixed: hdreamer not hidreamer
             elif getattr(config, 'use_poisson', False):
                 model_name = "pdreamer"
             else:

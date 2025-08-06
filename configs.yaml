@@ -11,7 +11,7 @@ defaults:
   parallel: False
   eval_every: 10000
   eval_episode_num: 10
-  log_every: 10000
+  log_every: 1000  # Log every 1000 steps instead of 10000 for better monitoring
   reset_every: 0
   device: 'cuda:0'
   compile: True
