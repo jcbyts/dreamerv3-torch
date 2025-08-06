@@ -1182,52 +1182,99 @@ def args_type(default):
 
     return lambda x: parse_string(x) if isinstance(x, str) else parse_object(x)
 
-
+# hierarchy-capable static scan
 def static_scan(fn, inputs, start):
     last = start
     indices = range(inputs[0].shape[0])
     flag = True
+    outputs = []  # Initialize outputs list
+
     for index in indices:
         inp = lambda x: (_input[x] for _input in inputs)
-        last = fn(last, *inp(index))
+        last = fn(last, *inp(index))  # 'last' is a tuple e.g., (post, prior, spatial)
+
         if flag:
-            if type(last) == type({}):
-                outputs = {
-                    key: value.clone().unsqueeze(0) for key, value in last.items()
-                }
-            else:
-                outputs = []
-                for _last in last:
-                    if type(_last) == type({}):
-                        outputs.append(
-                            {
-                                key: value.clone().unsqueeze(0)
-                                for key, value in _last.items()
-                            }
-                        )
-                    else:
-                        outputs.append(_last.clone().unsqueeze(0))
+            # First iteration: initialize the 'outputs' list of lists/dicts
+            for item in last:
+                if isinstance(item, dict):
+                    # Handle dictionaries containing tensors or lists of tensors
+                    output_dict = {}
+                    for key, value in item.items():
+                        if isinstance(value, list):
+                            # Handle hierarchical state (list of tensors)
+                            output_dict[key] = [v.clone().unsqueeze(0) for v in value]
+                        else:
+                            # Handle non-hierarchical state (single tensor)
+                            output_dict[key] = value.clone().unsqueeze(0)
+                    outputs.append(output_dict)
+                else:
+                    # Handle simple tensors (like spatial features)
+                    outputs.append(item.clone().unsqueeze(0))
             flag = False
         else:
-            if type(last) == type({}):
-                for key in last.keys():
-                    outputs[key] = torch.cat(
-                        [outputs[key], last[key].unsqueeze(0)], dim=0
-                    )
-            else:
-                for j in range(len(outputs)):
-                    if type(last[j]) == type({}):
-                        for key in last[j].keys():
-                            outputs[j][key] = torch.cat(
-                                [outputs[j][key], last[j][key].unsqueeze(0)], dim=0
+            # Subsequent iterations: concatenate to existing outputs
+            for i, item in enumerate(last):
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        if isinstance(value, list):
+                            for j in range(len(value)):
+                                outputs[i][key][j] = torch.cat(
+                                    [outputs[i][key][j], value[j].unsqueeze(0)], dim=0
+                                )
+                        else:
+                            outputs[i][key] = torch.cat(
+                                [outputs[i][key], value.unsqueeze(0)], dim=0
                             )
-                    else:
-                        outputs[j] = torch.cat(
-                            [outputs[j], last[j].unsqueeze(0)], dim=0
-                        )
-    if type(last) == type({}):
-        outputs = [outputs]
+                else:
+                    outputs[i] = torch.cat([outputs[i], item.unsqueeze(0)], dim=0)
+
     return outputs
+# Original Static Scan
+# def static_scan(fn, inputs, start):
+#     last = start
+#     indices = range(inputs[0].shape[0])
+#     flag = True
+#     for index in indices:
+#         inp = lambda x: (_input[x] for _input in inputs)
+#         last = fn(last, *inp(index))
+#         if flag:
+#             if type(last) == type({}):
+#                 outputs = {
+#                     key: value.clone().unsqueeze(0) for key, value in last.items()
+#                 }
+#             else:
+#                 outputs = []
+#                 for _last in last:
+#                     if type(_last) == type({}):
+#                         outputs.append(
+#                             {
+#                                 key: value.clone().unsqueeze(0)
+#                                 for key, value in _last.items()
+#                             }
+#                         )
+#                     else:
+#                         outputs.append(_last.clone().unsqueeze(0))
+#             flag = False
+#         else:
+#             if type(last) == type({}):
+#                 for key in last.keys():
+#                     outputs[key] = torch.cat(
+#                         [outputs[key], last[key].unsqueeze(0)], dim=0
+#                     )
+#             else:
+#                 for j in range(len(outputs)):
+#                     if type(last[j]) == type({}):
+#                         for key in last[j].keys():
+#                             outputs[j][key] = torch.cat(
+#                                 [outputs[j][key], last[j][key].unsqueeze(0)], dim=0
+#                             )
+#                     else:
+#                         outputs[j] = torch.cat(
+#                             [outputs[j], last[j].unsqueeze(0)], dim=0
+#                         )
+#     if type(last) == type({}):
+#         outputs = [outputs]
+#     return outputs
 
 
 class Every:

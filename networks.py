@@ -1371,14 +1371,22 @@ class hRSSM(RSSM):
             prev_state = self.initial(B)
             prev_action = torch.zeros(B, self._num_actions, device=self._device)
         elif torch.any(is_first):
-            mask = (~is_first).float().unsqueeze(-1)
-            prev_action = prev_action * mask
+            
+            prev_action_mask = (1 - is_first).float().unsqueeze(-1)
+            prev_action = prev_action * prev_action_mask
+            
             init_state = self.initial(B)
             for k, v in prev_state.items():
                 if isinstance(v, list):
                     for i in range(len(v)):
+                        # Dynamically reshape the mask for each tensor
+                        mask = (1 - is_first).float()
+                        mask = mask.reshape(mask.shape + (1,) * (v[i].ndim - mask.ndim))
                         prev_state[k][i] = v[i] * mask + init_state[k][i] * (1 - mask)
                 else:
+                    # dynamic mask to the 'deter' tensor
+                    mask = (1 - is_first).float()
+                    mask = mask.reshape(mask.shape + (1,) * (v.ndim - mask.ndim))
                     prev_state[k] = v * mask + init_state[k] * (1 - mask)
 
         # Utility: ensure encoder feats are (B, C, H, W)
@@ -1478,12 +1486,12 @@ class hRSSM(RSSM):
 
         def step(prev, a, embeds, first):
             post, prior, spatial = self.obs_step(prev[0], a, embeds, first, sample=True)
-            return (post, prior, spatial), (post, prior, spatial)
+            return post, prior, spatial
 
         results = tools.static_scan(
             step, (action_T, list(zip(*embed_list_T)), is_first_T), (state, state, None)
         )
-        (post_seq_T, prior_seq_T, spatial_seq_T) = results[1]
+        post_seq_T, prior_seq_T, spatial_seq_T = results
 
         unswap = lambda t: t.permute([1, 0] + list(range(2, t.ndim)))
         post_seq  = {k: (unswap(v) if not isinstance(v, list) else [unswap(x) for x in v]) for k, v in post_seq_T.items()}
@@ -1495,12 +1503,19 @@ class hRSSM(RSSM):
         swap = lambda x: x.permute([1, 0] + list(range(2, x.ndim)))
         action_T = swap(action)
 
-        def step(prev_state, act_t):
-            prior_t, spatial_t = self.img_step(prev_state, act_t, sample=sample)
-            return prior_t, (prior_t, spatial_t)
+        # def step(prev_state, act_t):
+        #     prior_t, spatial_t = self.img_step(prev_state, act_t, sample=sample)
+        #     return prior_t, spatial_t
 
-        results = tools.static_scan(step, [action_T], state)
-        priors_T, spatials_T = results[1]
+        # results = tools.static_scan(step, [action_T], state)
+        def step(prev_state, act_t):
+            # 'prev_state' is now always a tuple, so we can reliably get the state dict from index 0.
+            state_dict = prev_state[0]
+            prior_t, spatial_t = self.img_step(state_dict, act_t, sample=sample)
+            return prior_t, spatial_t
+        
+        results = tools.static_scan(step, [action_T], (state,))
+        priors_T, spatials_T = results
 
         unswap = lambda t: t.permute([1, 0] + list(range(2, t.ndim)))
         prior_seq = {
@@ -1552,10 +1567,22 @@ class hRSSM(RSSM):
     def get_dist_h(self, state_level):
         if self._discrete:
             logit = state_level["logit"]
-            return tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio)
+            # The Independent wrapper is the key fix. It sums over the last dimension.
+            dist = torchd.independent.Independent(
+                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
+            )
+            return dist
         else:
             mean, std = state_level["mean"], state_level["std"]
             return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(mean, std), 1))
+        
+    # def get_dist_h(self, state_level):
+    #     if self._discrete:
+    #         logit = state_level["logit"]
+    #         return tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio)
+    #     else:
+    #         mean, std = state_level["mean"], state_level["std"]
+    #         return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(mean, std), 1))
     
     def get_dist(self, full_state):
         dists = [self.get_dist_h({k: (v[i] if isinstance(v, list) else v)

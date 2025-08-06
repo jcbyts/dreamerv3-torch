@@ -106,8 +106,9 @@ class Dreamer(nn.Module):
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
-        print(f"obs keys: {obs.keys()}")
-        print(f"obs image shape: {obs['image'].shape}")
+        # DEBUGGING LINES
+        # print(f"obs keys: {obs.keys()}")
+        # print(f"obs image shape: {obs['image'].shape}")
         embed = self._wm.encoder(obs)
 
         obs_out = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
@@ -126,7 +127,10 @@ class Dreamer(nn.Module):
             actor = self._task_behavior.actor(feat)
             action = actor.sample()
         logprob = actor.log_prob(action)
-        latent = {k: v.detach() for k, v in latent.items()}
+        latent = { # handle latents that are hierarchical or flat
+            k: [item.detach() for item in v] if isinstance(v, list) else v.detach()
+            for k, v in latent.items()}
+        
         action = action.detach()
         if self._config.actor["dist"] == "onehot_gumble":
             action = torch.one_hot(
