@@ -292,7 +292,7 @@ dreamer:
   # ------------ logging ---------------------------------------------
   use_wandb: true
   wandb_entity: 'yateslab'
-  wandb_project: 'dreamer'
+  wandb_project: 'hdreamer'
 
   # ------------ choose world model ----------------------------------
   model: flat              # flat RSSM, uses dyn_* below
