@@ -46,9 +46,15 @@ class Dreamer(nn.Module):
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
-        # Use factory to create appropriate world model
-        from world_model_base import create_world_model
-        self._wm = create_world_model(obs_space, act_space, self._step, config)
+
+        # Initialize world model based on config
+        if config.model == 'h':
+            print("Initializing Hierarchical World Model (hWorldModel).")
+            self._wm = models.hWorldModel(obs_space, act_space, self._step, config)
+        else:
+            print("Initializing Flat World Model.")
+            self._wm = models.WorldModel(obs_space, act_space, self._step, config)
+        
         self._task_behavior = models.ImagBehavior(config, self._wm)
         if (
             config.compile and os.name != "nt"
@@ -100,8 +106,13 @@ class Dreamer(nn.Module):
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
+        print(f"obs keys: {obs.keys()}")
+        print(f"obs image shape: {obs['image'].shape}")
         embed = self._wm.encoder(obs)
-        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
+
+        obs_out = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
+        latent = obs_out[0]
+
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)

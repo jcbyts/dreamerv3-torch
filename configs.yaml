@@ -277,55 +277,7 @@ vizdoom_health_gathering:
   imag_gradient: 'reinforce'
   time_limit: 2100
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
-  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
-
-# Tiny models for fast iteration and proof-of-concept testing
-# Matched latent capacity between flat and hierarchical models
-
-tiny_dreamerv3:
-  # Tiny DreamerV3: just smaller latent space, everything else same as vizdoom config
-  encoder_type: 'original'
-  ladder_levels: 1
-  kl_balancing: false
-  dyn_hidden: 256
-  dyn_deter: 256
-  dyn_stoch: 12   # Total latent capacity: 12 * 32 = 384
-  dyn_discrete: 32
-  hierarchical_mode: false
-
-  # VizDoom compatibility
-  actor: {dist: 'onehot', std: 'none'}
-  imag_gradient: 'reinforce'
-  envs: 4
-
-  # Video logging
-  video_pred_log: true
-  eval_episode_num: 10
-
-# Tiny hierarchical variant for fast testing
-tiny_hdreamer:
-  # Tiny hDreamer: matched latent capacity (3 levels × 4 stoch = 12 total)
-  encoder_type: 'densenet_ladder'
-  ladder_levels: 3
-  kl_balancing: true
-  dense_growth: 16        # Smaller growth for faster training
-  dense_block_layers: 3   # Fewer layers per block
-  dense_compression: 0.5
-  dyn_hidden: 256
-  dyn_deter: 256
-  dyn_stoch: 12   # Total latent capacity: 12 * 32 = 384 (split across 3 levels)
-  dyn_discrete: 32
-  hierarchical_mode: true
-
-  # VizDoom compatibility
-  actor: {dist: 'onehot', std: 'none'}
-  imag_gradient: 'reinforce'
-  envs: 4
-
-  # Video logging
-  video_pred_log: true
-  eval_episode_num: 10
-    
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}    
 
 debug:
   debug: True
@@ -373,20 +325,21 @@ hdreamer:
     h_levels:      3
     h_hidden_dim:  256      # hidden size in stat heads
     h_stoch_dims: [10, 10, 12]   # per-level categorical variables
-    h_deter_dims: [128, 128, 256] # per-level GRU chunks
+    h_deter_dims: [128, 128, 128] # per-level GRU chunks (divisible by 3)
     discrete:      32       # categories per variable
     act: 'SiLU'
     norm: true
-    up_mode: 'nearest'
+    up_mode: 'bilinear' # must be 'bilinear' 
 
   # ------------ encoder configuration (for hConvEncoder) ------------
   encoder:
-    depth: 32               # base channel depth
+    depth: 64               # base channel depth
     levels: 3               # number of hierarchical levels (matches rssm.h_levels)
     act: 'SiLU'
     norm: true
     kernel_size: 4
     minres: 4
+    grow_channels: false
 
   # ------------ decoder configuration (for DecoderHead) -------------
   decoder:

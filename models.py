@@ -59,14 +59,14 @@ class WorldModel(nn.Module):
         )
         self.heads = nn.ModuleDict()
         if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            self.feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
-            feat_size = config.dyn_stoch + config.dyn_deter
+            self.feat_size = config.dyn_stoch + config.dyn_deter
         self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder
+            self.feat_size, shapes, **config.decoder
         )
         self.heads["reward"] = networks.MLP(
-            feat_size,
+            self.feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
             config.reward_head["layers"],
             config.units,
@@ -78,7 +78,7 @@ class WorldModel(nn.Module):
             name="Reward",
         )
         self.heads["cont"] = networks.MLP(
-            feat_size,
+            self.feat_size,
             (),
             config.cont_head["layers"],
             config.units,
@@ -223,10 +223,10 @@ class ImagBehavior(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         self._world_model = world_model
-        if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
-        else:
-            feat_size = config.dyn_stoch + config.dyn_deter
+        
+        # ask the world mdoel for the feature size (it should know how much it is exposing to the actor / value)
+        feat_size = world_model.feat_size
+
         self.actor = networks.MLP(
             feat_size,
             (config.num_actions,),
@@ -298,7 +298,7 @@ class ImagBehavior(nn.Module):
         metrics = {}
 
         with tools.RequiresGrad(self.actor):
-            with torch.cuda.amp.autocast(self._use_amp):
+            with torch.amp.autocast('cuda', enabled=self._use_amp):
                 imag_feat, imag_state, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
                 )
@@ -481,7 +481,7 @@ class DecoderHead(nn.Module):
         else:
             mean = mean.reshape(batch_shape[0], 1, *self._output_shape)  # degenerate T=1
 
-        mean = mean.permute(0, 1, 3, 4, 2)  # (B,T,H,W,C)
+        # mean = mean.permute(0, 1, 2, 3, 4)  # (B,T,H,W,C)
         mean = F.sigmoid(mean) if self._cnn_sigmoid else (mean + 0.5)
         return {'image': tools.MSEDist(mean)}
 
@@ -499,29 +499,31 @@ class hWorldModel(WorldModel):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         
         self.encoder = networks.hConvEncoder(shapes['image'], **config.encoder)
-
-        # Calculate encoder output channel dimensions for each level
-        # hConvEncoder produces: [stem(depth), block1(depth*2), block2(depth*4), ...]
-        encoder_dims = [config.encoder['depth'] * (2**i) for i in range(config.encoder['levels'])]
         
         self.dynamics = networks.hRSSM(
-            h_encoder_dims=list(reversed(encoder_dims)),
+            h_encoder_dims=list(self.encoder.out_channels),
             **config.rssm,
-            **config,
+            device=config.device,
+            num_actions=config.num_actions,
+            unimix_ratio=config.unimix_ratio,
+            initial=config.initial,
+            dyn_mean_act=config.dyn_mean_act,
+            dyn_std_act=config.dyn_std_act,
+            dyn_min_std=config.dyn_min_std,
         )
         
         self.heads = nn.ModuleDict()
 
         # The decoder head now takes its input from the hRSSM's spatial features
-        spatial_channels = self.dynamics.spatial_channels()
+        spatial_channels = self.dynamics._z_flat_ch[0]
         self.heads["decoder"] = DecoderHead(
             spatial_channels, shapes['image'], config.decoder['cnn_sigmoid']
         )
         
-        feat_size = sum(config.rssm['h_stoch_dims']) + sum(config.rssm['h_deter_dims'])
+        self.feat_size = self.dynamics.feat_size() #sum(config.rssm['h_stoch_dims']) + sum(config.rssm['h_deter_dims'])
 
         self.heads["reward"] = networks.MLP(
-            feat_size,
+            self.feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
             config.reward_head["layers"],
             config.units,
@@ -533,7 +535,7 @@ class hWorldModel(WorldModel):
             name="Reward",
         )
         self.heads["cont"] = networks.MLP(
-            feat_size,
+            self.feat_size,
             (),
             config.cont_head["layers"],
             config.units,
@@ -619,16 +621,18 @@ class hWorldModel(WorldModel):
         post_detached = {k: (v if not isinstance(v, list) else [i.detach() for i in v]) for k, v in post.items()}
         return post_detached, {}, metrics
 
-    # how many channels does _build_spatial() output?
-    def spatial_channels(self):
-        z = sum(d * self._discrete if self._discrete else d
-                for d in self._h_stoch_dims)
-        d = sum(self._h_deter_dims)
-        return z + d 
+    # # how many channels does _build_spatial() output?
+    # def spatial_channels(self):
+    #     z = sum(d * self._discrete if self._discrete else d
+    #             for d in self._h_stoch_dims)
+    #     d = sum(self._h_deter_dims)
+    #     return z + d 
     
     def preprocess(self, obs):
         obs = {
-            k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
+            k: (v.clone().detach().to(device=self._config.device, dtype=torch.float32)
+                if isinstance(v, torch.Tensor)
+                else torch.tensor(v, device=self._config.device, dtype=torch.float32))
             for k, v in obs.items()
         }
         if "discount" in obs:
