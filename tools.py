@@ -1191,42 +1191,73 @@ def static_scan(fn, inputs, start):
 
     for index in indices:
         inp = lambda x: (_input[x] for _input in inputs)
-        last = fn(last, *inp(index))  # 'last' is a tuple e.g., (post, prior, spatial)
+        last = fn(last, *inp(index))  # 'last' could be a dict (flat RSSM) or tuple (hierarchical RSSM)
 
         if flag:
-            # First iteration: initialize the 'outputs' list of lists/dicts
-            for item in last:
-                if isinstance(item, dict):
-                    # Handle dictionaries containing tensors or lists of tensors
-                    output_dict = {}
-                    for key, value in item.items():
-                        if isinstance(value, list):
-                            # Handle hierarchical state (list of tensors)
-                            output_dict[key] = [v.clone().unsqueeze(0) for v in value]
-                        else:
-                            # Handle non-hierarchical state (single tensor)
-                            output_dict[key] = value.clone().unsqueeze(0)
-                    outputs.append(output_dict)
-                else:
-                    # Handle simple tensors (like spatial features)
-                    outputs.append(item.clone().unsqueeze(0))
+            # Check if last is a single dict (flat RSSM) or tuple/list (hierarchical RSSM)
+            if isinstance(last, dict):
+                # Flat RSSM case: single dictionary
+                output_dict = {}
+                for key, value in last.items():
+                    if isinstance(value, list):
+                        # Handle hierarchical state (list of tensors)
+                        output_dict[key] = [v.clone().unsqueeze(0) for v in value]
+                    else:
+                        # Handle non-hierarchical state (single tensor)
+                        output_dict[key] = value.clone().unsqueeze(0)
+                outputs = output_dict
+            else:
+                # Hierarchical RSSM case: tuple/list of items
+                for item in last:
+                    if isinstance(item, dict):
+                        # Handle dictionaries containing tensors or lists of tensors
+                        output_dict = {}
+                        for key, value in item.items():
+                            if isinstance(value, list):
+                                # Handle hierarchical state (list of tensors)
+                                output_dict[key] = [v.clone().unsqueeze(0) for v in value]
+                            else:
+                                # Handle non-hierarchical state (single tensor)
+                                output_dict[key] = value.clone().unsqueeze(0)
+                        outputs.append(output_dict)
+                    else:
+                        # Handle simple tensors (like spatial features)
+                        outputs.append(item.clone().unsqueeze(0))
             flag = False
         else:
             # Subsequent iterations: concatenate to existing outputs
-            for i, item in enumerate(last):
-                if isinstance(item, dict):
-                    for key, value in item.items():
-                        if isinstance(value, list):
-                            for j in range(len(value)):
-                                outputs[i][key][j] = torch.cat(
-                                    [outputs[i][key][j], value[j].unsqueeze(0)], dim=0
-                                )
-                        else:
-                            outputs[i][key] = torch.cat(
-                                [outputs[i][key], value.unsqueeze(0)], dim=0
+            if isinstance(last, dict):
+                # Flat RSSM case: single dictionary
+                for key, value in last.items():
+                    if isinstance(value, list):
+                        for j in range(len(value)):
+                            outputs[key][j] = torch.cat(
+                                [outputs[key][j], value[j].unsqueeze(0)], dim=0
                             )
-                else:
-                    outputs[i] = torch.cat([outputs[i], item.unsqueeze(0)], dim=0)
+                    else:
+                        outputs[key] = torch.cat(
+                            [outputs[key], value.unsqueeze(0)], dim=0
+                        )
+            else:
+                # Hierarchical RSSM case: tuple/list of items
+                for i, item in enumerate(last):
+                    if isinstance(item, dict):
+                        for key, value in item.items():
+                            if isinstance(value, list):
+                                for j in range(len(value)):
+                                    outputs[i][key][j] = torch.cat(
+                                        [outputs[i][key][j], value[j].unsqueeze(0)], dim=0
+                                    )
+                            else:
+                                outputs[i][key] = torch.cat(
+                                    [outputs[i][key], value.unsqueeze(0)], dim=0
+                                )
+                    else:
+                        outputs[i] = torch.cat([outputs[i], item.unsqueeze(0)], dim=0)
+
+    # Ensure consistent return format: always return a list
+    if isinstance(outputs, dict):
+        outputs = [outputs]
 
     return outputs
 # Original Static Scan

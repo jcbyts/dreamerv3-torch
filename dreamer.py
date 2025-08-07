@@ -81,47 +81,27 @@ class Dreamer(nn.Module):
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
 
-                # Update logger step for each training step
-                self._logger.step = self._step * self._config.action_repeat + i
-
-                # Log every 100 training steps for immediate feedback
-                if (self._update_count % 100) == 0:
-                    # Log key metrics immediately for monitoring
-                    key_metrics = {}
-                    for name in ["model_loss", "actor_loss", "value_loss", "kl", "actor_entropy"]:
-                        if name in self._metrics and self._metrics[name]:
-                            key_metrics[name] = float(np.mean(self._metrics[name]))
-
-                    if key_metrics:
-                        # Log to wandb immediately for monitoring
-                        for name, value in key_metrics.items():
-                            self._logger.scalar(f"immediate/{name}", value)
-                        self._logger.write(fps=False, step=self._logger.step)
-
         policy_output, state = self._policy(obs, state, training)
 
         if training:
+            # Store the step before incrementing for logging
+            current_step = self._step
             self._step += len(reset)
             self._logger.step = self._config.action_repeat * self._step
 
-            # Check for main logging AFTER step increment
-            should_log_result = self._should_log(self._step)
-            if should_log_result:
-                print(f"[LOGGING] Step {self._step}, should_log returned {should_log_result}, update_count {self._update_count}")
-
+            # Simple logging check - use the step before increment for consistency
+            if current_step > 0 and (current_step % self._config.log_every) == 0:
                 for name, values in self._metrics.items():
-                    self._logger.scalar(name, float(np.mean(values)))
-                    self._metrics[name] = []
+                    if values:  # Only log if we have values
+                        self._logger.scalar(name, float(np.mean(values)))
+                        self._metrics[name] = []
+
                 if self._config.video_pred_log:
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
 
-                # Linear probing disabled for vanilla dreamer
-                # (Can be re-enabled later if needed)
-
+                # Use the current logger step for consistency
                 self._logger.write(fps=True)
-            elif (self._step % 100) == 0:  # Debug every 100 steps
-                print(f"[DEBUG] Step {self._step}, should_log returned {should_log_result}, update_count {self._update_count}, log_every {self._config.log_every}")
 
         return policy_output, state
 

@@ -1401,41 +1401,33 @@ class hRSSM(RSSM):
             prev_state = self.initial(B)
             prev_action = torch.zeros(B, self._num_actions, device=self._device)
 
-        # elif torch.sum(is_first) > 0:
-        #     # *** START FIX ***
-        #     # Do NOT modify prev_state in-place. Create a new state dictionary.
-        #     new_state = {}
-        #     is_first_r_action = is_first[:, None]
-        #     # prev_action *= 1.0 - is_first_r_action
-        #     prev_action = prev_action * (1.0 - is_first_r_action)
-        #     init_state = self.initial(len(is_first))
-
-        #     for key, val in prev_state.items():
-        #         is_first_r = torch.reshape(
-        #             is_first,
-        #             is_first.shape + (1,) * (len(val.shape) - len(is_first.shape)),
-        #         )
-        #         new_state[key] = val * (1.0 - is_first_r) + init_state[key] * is_first_r
-        #     prev_state = new_state
-
         elif torch.any(is_first):
+            # Create a mask from the is_first tensor to zero out actions and states.
+            mask = (1 - is_first).float().unsqueeze(-1)
             
-            prev_action_mask = (1 - is_first).float().unsqueeze(-1)
-            prev_action = prev_action * prev_action_mask
+            # Create a new action tensor instead of modifying in-place.
+            prev_action = prev_action * mask
             
-            init_state = self.initial(B)
-            for k, v in prev_state.items():
-                if isinstance(v, list):
-                    for i in range(len(v)):
-                        # Dynamically reshape the mask for each tensor
-                        mask = (1 - is_first).float()
-                        mask = mask.reshape(mask.shape + (1,) * (v[i].ndim - mask.ndim))
-                        prev_state[k][i] = v[i] * mask + init_state[k][i] * (1 - mask)
-                else:
-                    # dynamic mask to the 'deter' tensor
-                    mask = (1 - is_first).float()
-                    mask = mask.reshape(mask.shape + (1,) * (v.ndim - mask.ndim))
-                    prev_state[k] = v * mask + init_state[k] * (1 - mask)
+            # Create a new state dictionary to avoid modifying the original.
+            new_state = {}
+            init_state = self.initial(len(is_first))
+
+            for key, value in prev_state.items():
+                if isinstance(value, list): # Handle hierarchical state lists (stoch, logit, etc.)
+                    new_state[key] = []
+                    for i in range(len(value)):
+                        # Dynamically reshape the mask for each tensor in the list.
+                        value_mask = (1 - is_first).float()
+                        value_mask = value_mask.view(value_mask.shape + (1,) * (value[i].ndim - value_mask.ndim))
+                        # Combine the old state with the initial state.
+                        new_state[key].append(value[i] * value_mask + init_state[key][i] * (1 - value_mask))
+                else: # Handle non-list tensors (like 'deter')
+                    value_mask = (1 - is_first).float()
+                    value_mask = value_mask.view(value_mask.shape + (1,) * (value.ndim - value_mask.ndim))
+                    new_state[key] = value * value_mask + init_state[key] * (1 - value_mask)
+
+            # Replace the old state with the newly created one.
+            prev_state = new_state
 
         # Utility: ensure encoder feats are (B, C, H, W)
         def as_spatial(feat):
@@ -1590,25 +1582,39 @@ class hRSSM(RSSM):
         kld = torchd.kl.kl_divergence
         sg = lambda x: {k: v.detach() if isinstance(v, torch.Tensor) else [vi.detach() for vi in v] for k, v in x.items()}
 
+        # Distribute the free bits equally across all hierarchy levels for proper KL balancing
+        free_per_level = free / self._h_levels
+
         dyn_loss_list, rep_loss_list, kl_value_list = [], [], []
 
         for i in range(self._h_levels):
-            post_dist = self.get_dist_h({k: v[i] for k, v in post.items()})
-            prior_dist = self.get_dist_h({k: v[i] for k, v in prior.items()})
-            prior_dist_sg = self.get_dist_h({k: v[i] for k, v in sg(prior).items()})
-            post_dist_sg = self.get_dist_h({k: v[i] for k, v in sg(post).items()})
-            
-            dyn_loss_list.append(kld(post_dist_sg, prior_dist))
-            rep_loss_list.append(kld(post_dist, prior_dist_sg))
+            # Extract level-specific stats (only the fields that are lists)
+            post_level = {k: v[i] for k, v in post.items() if isinstance(v, list)}
+            prior_level = {k: v[i] for k, v in prior.items() if isinstance(v, list)}
+            prior_level_sg = {k: v[i] for k, v in sg(prior).items() if isinstance(v, list)}
+            post_level_sg = {k: v[i] for k, v in sg(post).items() if isinstance(v, list)}
+
+            post_dist = self.get_dist_h(post_level)
+            prior_dist = self.get_dist_h(prior_level)
+            prior_dist_sg = self.get_dist_h(prior_level_sg)
+            post_dist_sg = self.get_dist_h(post_level_sg)
+
+            # Calculate KL divergence for the current level
+            dyn_loss_level = kld(post_dist_sg, prior_dist)
+            rep_loss_level = kld(post_dist, prior_dist_sg)
+
+            # Apply free bits clipping to each level individually (proper KL balancing)
+            dyn_loss_list.append(torch.clip(dyn_loss_level, min=free_per_level))
+            rep_loss_list.append(torch.clip(rep_loss_level, min=free_per_level))
+
+            # Keep the original, unclipped value for logging/metrics
             kl_value_list.append(kld(post_dist, prior_dist))
-        
+
+        # Sum the clipped values (proper KL balancing: clip first, then sum)
         dyn_loss = torch.stack(dyn_loss_list, dim=0).sum(0)
         rep_loss = torch.stack(rep_loss_list, dim=0).sum(0)
         kl_value = torch.stack(kl_value_list, dim=0).sum(0)
 
-        dyn_loss = torch.clip(dyn_loss, min=free)
-        rep_loss = torch.clip(rep_loss, min=free)
-        
         loss = dyn_scale * dyn_loss + rep_scale * rep_loss
         return loss, kl_value, dyn_loss, rep_loss
 

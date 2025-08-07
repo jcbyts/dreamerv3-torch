@@ -231,7 +231,117 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 
-#%% Cell 9: Summary
+#%% Cell 9: Full hWorldModel backward test with larger batch
+print("\n=== Testing full hWorldModel backward pass (batch size 4) ===")
+
+import torch
+
+# turn on anomaly detection just for this block
+torch.autograd.set_detect_anomaly(True)
+
+try:
+    batch_size = 4
+
+    # 1) Prepare a batch by repeating the single obs 4×
+    img = torch.from_numpy(obs['image']).float()  # (H,W,C)
+    img = img.unsqueeze(0).unsqueeze(0)           # (1,1,H,W,C)
+    img = img.expand(batch_size, 1, *img.shape[2:]).to(config.device)
+
+    obs_batch = {
+        'image':       img,
+        'is_first':    torch.ones((batch_size,1), dtype=torch.bool, device=config.device),
+        'is_terminal': torch.zeros((batch_size,1), dtype=torch.bool, device=config.device),
+    }
+
+    # 2) Preprocess & encode
+    proc   = world_model.preprocess(obs_batch)
+    embeds = world_model.encoder(proc)
+
+    # 3) Dynamics
+    prev_action = torch.zeros((batch_size, config.num_actions), device=config.device, requires_grad=True)
+    post, prior, spat = world_model.dynamics.obs_step(
+        None,
+        prev_action,
+        embeds,
+        proc['is_first'].squeeze(-1),
+        sample=True
+    )
+
+    # 4) Decode
+    dec_out = world_model.heads['decoder'](spat)
+    recon   = dec_out['image'].mode()  # (B,H,W,C)
+
+    # 5) Compute MSE loss against inputs
+    target = proc['image'].squeeze(1)  # (B,H,W,C)
+    loss   = (recon - target).pow(2).mean()
+
+    # 6) Backward
+    loss.backward()
+    print("✅ Full world_model backward passed cleanly with batch size", batch_size)
+    print(f"   loss = {loss.item():.4f}")
+
+except RuntimeError as e:
+    print("❌ RuntimeError during full-model backward:")
+    print(e)
+    import traceback; traceback.print_exc()
+
+finally:
+    torch.autograd.set_detect_anomaly(False)
+
+#%% Cell 10: blockdiagGRU test
+from networks import BlockDiagGRUCell
+
+# Test parameters
+batch = 4
+T = 5
+inp_size = 16
+hidden_size = 32
+blocks = 4
+
+# Initialize the GRU cell
+cell = BlockDiagGRUCell(inp_size, hidden_size, blocks, norm=True)
+
+# Create initial hidden state and input sequence
+h = torch.zeros(batch, hidden_size, requires_grad=True)
+x_seq = torch.randn(T, batch, inp_size, requires_grad=True)
+
+# Perform a multi-step "scan" through the GRU cell
+h_list = []
+h_t = h
+for t in range(T):
+    h_t, [h_t] = cell(x_seq[t], [h_t])
+    h_list.append(h_t)
+
+# Stack outputs and compute a dummy loss
+H = torch.stack(h_list, dim=0)  # Shape: (T, batch, hidden_size)
+loss = H.pow(2).mean()
+
+# Backward pass with anomaly detection
+torch.autograd.set_detect_anomaly(True)
+loss.backward()
+torch.autograd.set_detect_anomaly(False)
+
+print("✅ Multi-step BPTT backward passed cleanly!")
+
+cell = BlockDiagGRUCell(inp_size, hidden_size, blocks, norm=True)
+h = torch.zeros(batch, hidden_size, requires_grad=True)
+x_seq = torch.randn(T, batch, inp_size, requires_grad=True)
+
+# a toy scan:
+h_list = []
+h_t = h
+for t in range(T):
+    h_t, [h_t] = cell(x_seq[t], [h_t])
+    h_list.append(h_t)
+
+# stack and a dummy loss over the whole trajectory:
+H = torch.stack(h_list, 0)       # (T, B, hidden)
+loss = H.pow(2).mean()
+with torch.autograd.detect_anomaly():
+    loss.backward()              # <- this will reproduce your training‐time error
+
+
+#%% Cell 10: Summary
 print("\n=== Summary ===")
 print("If all tests passed, your hWorldModel is working correctly!")
 print("You can now use it in the full training loop.")
@@ -239,4 +349,18 @@ print("You can now use it in the full training loop.")
 # Clean up
 env.close()
 
+# %%
+import torch
+from networks import BlockDiagGRUCell
+
+batch, inp, size, blocks = 4, 16, 32, 4
+cell = BlockDiagGRUCell(inp, size, blocks, norm=True, act=torch.tanh)
+h0 = torch.zeros(batch, size, requires_grad=True)
+x  = torch.randn(batch, inp, requires_grad=True)
+
+with torch.autograd.detect_anomaly():
+    out, [h1] = cell(x, [h0])
+    loss = out.pow(2).sum()
+    loss.backward()
+print("✅ minimal test passed")
 # %%
