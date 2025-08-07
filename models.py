@@ -299,7 +299,8 @@ class ImagBehavior(nn.Module):
         start,
         objective,
     ):
-        self._update_slow_target()
+        # DECISIVE TEST: Comment out Polyak update to isolate the issue
+        # self._update_slow_target()
         metrics = {}
 
         with tools.RequiresGrad(self.actor):
@@ -334,10 +335,12 @@ class ImagBehavior(nn.Module):
                 target = torch.stack(target, dim=1)
                 # (time, batch, 1), (time, batch, 1) -> (time, batch)
                 value_loss = -value.log_prob(target.detach())
-                slow_target = self._slow_value(value_input[:-1].detach())
                 if self._config.critic["slow_target"]:
-                    # value_loss -= value.log_prob(slow_target.mode().detach())
-                    value_loss = value_loss - slow_target.log_prob(value.mode().detach())
+                    # Compute slow critic distribution without tracking gradients
+                    with torch.no_grad():
+                        slow_v = self._slow_value(value_input[:-1].detach())
+                    # Regularize online critic toward slow critic in distribution space
+                    value_loss = value_loss - slow_v.log_prob(value.mode().detach())
                 # (time, batch, 1), (time, batch, 1) -> (1,)
                 value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
@@ -356,6 +359,9 @@ class ImagBehavior(nn.Module):
         with tools.RequiresGrad(self):
             metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
+            # SAFE POLYAK UPDATE: must run after all backward/optimizer steps
+            if hasattr(self, "_polyak_update"):
+                self._polyak_update()
         return imag_feat, imag_state, imag_action, weights, metrics
 
 
@@ -471,14 +477,22 @@ class ImagBehavior(nn.Module):
     #             for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
     #                 d.data = mix * s.data + (1 - mix) * d.data
     #         self._updates += 1
-    def _update_slow_target(self):
-        if self._config.critic["slow_target"]:
-            if self._updates % self._config.critic["slow_target_update"] == 0:
-                mix = self._config.critic["slow_target_fraction"]
-                with torch.no_grad():
-                    for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
-                        d.copy_(mix * s + (1 - mix) * d)
+    # ------------------------------------------------------------------------ #
+    #  SAFE POLYAK UPDATE (runs after backprop)                                #
+    # ------------------------------------------------------------------------ #
+    def _polyak_update(self):
+        if not self._config.critic.get("slow_target", True):
+            return
+        # update every K steps
+        K = self._config.critic.get("slow_target_update", 1)
+        if (self._updates % K) != 0:
             self._updates += 1
+            return
+        tau = float(self._config.critic.get("slow_target_fraction", 0.005))
+        with torch.no_grad():
+            for p_src, p_tgt in zip(self.value.parameters(), self._slow_value.parameters()):
+                p_tgt.lerp_(p_src, tau)
+        self._updates += 1
 
 
 #-----------------------------------------------------------------

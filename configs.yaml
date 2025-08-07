@@ -95,7 +95,7 @@ defaults:
   train_ratio: 512
   pretrain: 100
   model_lr: 1.0e-4
-  opt_eps: 1.0e-5
+  opt_eps: 1.0e-8
   grad_clip: 1000
   dataset_size: 1000000
   opt: 'adam'
@@ -298,7 +298,7 @@ dreamer:
   model: flat              # flat RSSM, uses dyn_* below
   # ------------ latent / RSSM ---------------------------------------
   dyn_hidden:   512        # size of hidden MLP in stat heads (flat)
-  dyn_deter:    510        # deterministic GRU state
+  dyn_deter:    512        # deterministic GRU state
   dyn_stoch:     32        # number of categorical variables
   dyn_discrete:  32        # categories per variable
   dyn_rec_depth: 1         # RSSM recurrent depth

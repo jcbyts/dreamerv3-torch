@@ -76,33 +76,28 @@ class Dreamer(nn.Module):
                 if self._should_pretrain()
                 else self._should_train(step)
             )
-            for i in range(steps):
+            for _ in range(steps):
                 self._train(next(self._dataset))
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
-
-        policy_output, state = self._policy(obs, state, training)
-
-        if training:
-            # Store the step before incrementing for logging
-            current_step = self._step
-            self._step += len(reset)
-            self._logger.step = self._config.action_repeat * self._step
-
-            # Simple logging check - use the step before increment for consistency
-            if current_step > 0 and (current_step % self._config.log_every) == 0:
+            if self._should_log(step):
                 for name, values in self._metrics.items():
-                    if values:  # Only log if we have values
-                        self._logger.scalar(name, float(np.mean(values)))
-                        self._metrics[name] = []
-
+                    self._logger.scalar(name, float(np.mean(values)))
+                    self._metrics[name] = []
                 if self._config.video_pred_log:
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
 
-                # Use the current logger step for consistency
+                # Linear probing disabled for vanilla dreamer
+                # (Can be re-enabled later if needed)
+
                 self._logger.write(fps=True)
 
+        policy_output, state = self._policy(obs, state, training)
+
+        if training:
+            self._step += len(reset)
+            self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
     def _policy(self, obs, state, training):
@@ -111,6 +106,9 @@ class Dreamer(nn.Module):
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
+        # DEBUGGING LINES
+        # print(f"obs keys: {obs.keys()}")
+        # print(f"obs image shape: {obs['image'].shape}")
         embed = self._wm.encoder(obs)
 
         obs_out = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])

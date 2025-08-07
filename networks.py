@@ -1300,6 +1300,11 @@ class hRSSM(RSSM):
         prior  : dict with per-level stats and samples (same ordering as levels: 0..L-1 finest->coarsest)
         spatial: composed spatial feature map built from deter and prior stoch
         """
+        # DECISIVE TEST: Deep-copy hierarchical state to break list sharing
+        prev_state = {
+            k: [v_i.clone() for v_i in v] if isinstance(v, list) else v.clone()
+            for k, v in prev_state.items()
+        }
         B = prev_action.shape[0]
         K = self._discrete if self._discrete else 1
         L = self._h_levels
@@ -1395,6 +1400,12 @@ class hRSSM(RSSM):
         Returns:
         post, prior, spatial_post
         """
+        # DECISIVE TEST: Deep-copy hierarchical state to break list sharing
+        if prev_state is not None:
+            prev_state = {
+                k: [v_i.clone() for v_i in v] if isinstance(v, list) else v.clone()
+                for k, v in prev_state.items()
+            }
         # Handle episode starts
         B = embed_list[0].shape[0] # should work regardless of whether prev_action or perv_state are none
         if prev_state is None or torch.all(is_first):
