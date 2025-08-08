@@ -80,24 +80,23 @@ class Dreamer(nn.Module):
                 self._train(next(self._dataset))
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
-            if self._should_log(step):
+
+        policy_output, state = self._policy(obs, state, training)
+
+        if training:
+            # Advance environment step and update logger step first
+            self._step += len(reset)
+            self._logger.step = self._config.action_repeat * self._step
+
+            # Log exactly every config.log_every env steps
+            if self._should_log(self._step):
                 for name, values in self._metrics.items():
                     self._logger.scalar(name, float(np.mean(values)))
                     self._metrics[name] = []
                 if self._config.video_pred_log:
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
-
-                # Linear probing disabled for vanilla dreamer
-                # (Can be re-enabled later if needed)
-
                 self._logger.write(fps=True)
-
-        policy_output, state = self._policy(obs, state, training)
-
-        if training:
-            self._step += len(reset)
-            self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
     def _policy(self, obs, state, training):

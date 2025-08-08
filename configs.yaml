@@ -207,7 +207,7 @@ memorymaze:
 vizdoom:
   task: vizdoom_basic
   steps: 1000000
-  prefill: 10000
+  prefill: 2500
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -222,7 +222,7 @@ vizdoom:
 vizdoom_basic:
   task: vizdoom_basic
   steps: 1000000
-  prefill: 10000
+  prefill: 2500
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -237,7 +237,7 @@ vizdoom_basic:
 vizdoom_deadly_corridor:
   task: vizdoom_deadly_corridor
   steps: 1000000
-  prefill: 10000
+  prefill: 2500
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -252,7 +252,7 @@ vizdoom_deadly_corridor:
 vizdoom_defend_center:
   task: vizdoom_defend_the_center
   steps: 1000000
-  prefill: 10000
+  prefill: 2500
   action_repeat: 1
   envs: 4
   train_ratio: 512
@@ -267,7 +267,7 @@ vizdoom_defend_center:
 vizdoom_health_gathering:
   task: vizdoom_health_gathering
   steps: 1000000
-  prefill: 10000
+  prefill: 2500
   action_repeat: 1
   envs: 4
   train_ratio: 512

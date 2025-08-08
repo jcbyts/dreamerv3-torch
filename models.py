@@ -21,8 +21,10 @@ class RewardEMA:
     def __call__(self, x, ema_vals):
         flat_x = torch.flatten(x.detach())
         x_quantile = torch.quantile(input=flat_x, q=self.range)
-        # this should be in-place operation
-        ema_vals[:] = self.alpha * x_quantile + (1 - self.alpha) * ema_vals
+        # Mutate the buffer outside autograd to avoid inplace operation conflicts
+        with torch.no_grad():
+            ema_vals.lerp_(x_quantile, self.alpha)
+            # ema_vals.copy_(self.alpha * x_quantile + (1 - self.alpha) * ema_vals)
         scale = torch.clip(ema_vals[1] - ema_vals[0], min=1.0)
         offset = ema_vals[0]
         return offset.detach(), scale.detach()
@@ -299,8 +301,7 @@ class ImagBehavior(nn.Module):
         start,
         objective,
     ):
-        # DECISIVE TEST: Comment out Polyak update to isolate the issue
-        # self._update_slow_target()
+      
         metrics = {}
 
         with tools.RequiresGrad(self.actor):
@@ -308,9 +309,10 @@ class ImagBehavior(nn.Module):
                 imag_feat, imag_state, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
                 )
+                imag_feat = imag_feat.detach()
                 reward = objective(imag_feat, imag_state, imag_action)
                 actor_ent = self.actor(imag_feat).entropy()
-                state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
+                # state_ent = self._world_model.dynamics.get_dist(imag_state).entropy() # unused values
                 # this target is not scaled by ema or sym_log.
                 target, weights, base = self._compute_target(
                     imag_feat, imag_state, reward
@@ -378,8 +380,7 @@ class ImagBehavior(nn.Module):
         def step(prev, _):
             state, _, _ = prev
             feat = dynamics.get_feat(state)
-            inp = feat.detach()
-            action = policy(inp).sample()
+            action = policy(feat).sample()
             succ = dynamics.img_step(state, action)
             if isinstance(succ, tuple):
                 succ = succ[0] # hRSSM returns a tuple of (prior, spatial)
