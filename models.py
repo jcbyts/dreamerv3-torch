@@ -230,7 +230,7 @@ class ImagBehavior(nn.Module):
 
         self._config = config
         self._world_model = world_model
-        
+
         # ask the world mdoel for the feature size (it should know how much it is exposing to the actor / value)
         feat_size = world_model.feat_size
 
@@ -291,9 +291,9 @@ class ImagBehavior(nn.Module):
         )
         if self._config.reward_EMA:
             # register ema_vals to nn.Module for enabling torch.save and torch.load
-            self.register_buffer(
-                "ema_vals", torch.zeros((2,), device=self._config.device)
-            )
+            # Seed EMA range to a small, sane window to avoid early exploding advantages.
+            init_ema = torch.tensor([-1.0, 1.0], device=self._config.device)
+            self.register_buffer("ema_vals", init_ema.clone())
             self.reward_ema = RewardEMA(device=self._config.device)
 
     def _train(
@@ -301,15 +301,17 @@ class ImagBehavior(nn.Module):
         start,
         objective,
     ):
-      
+
         metrics = {}
 
         with tools.RequiresGrad(self.actor):
             with torch.amp.autocast('cuda', enabled=self._use_amp):
+                dyn = (self._config.imag_gradient in ["dynamics", "both"])
                 imag_feat, imag_state, imag_action = self._imagine(
-                    start, self.actor, self._config.imag_horizon
+                    start, self.actor, self._config.imag_horizon, allow_grad=dyn
                 )
-                imag_feat = imag_feat.detach()
+                if not dyn:
+                    imag_feat = imag_feat.detach()
                 reward = objective(imag_feat, imag_state, imag_action)
                 actor_ent = self.actor(imag_feat).entropy()
                 # state_ent = self._world_model.dynamics.get_dist(imag_state).entropy() # unused values
@@ -332,7 +334,7 @@ class ImagBehavior(nn.Module):
                 value_input = imag_feat
 
         with tools.RequiresGrad(self.value):
-            with torch.cuda.amp.autocast(self._use_amp):
+            with torch.amp.autocast('cuda', enabled=self._use_amp):
                 value = self.value(value_input[:-1].detach())
                 target = torch.stack(target, dim=1)
                 # (time, batch, 1), (time, batch, 1) -> (time, batch)
@@ -367,10 +369,10 @@ class ImagBehavior(nn.Module):
         return imag_feat, imag_state, imag_action, weights, metrics
 
 
-    def _imagine(self, start, policy, horizon):
+    def _imagine(self, start, policy, horizon, allow_grad=True):
         dynamics = self._world_model.dynamics
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-        
+
         # handle both hierarchical and flat latents
         start = {
             k: [flatten(x) for x in v] if isinstance(v, list) else flatten(v)
@@ -384,10 +386,13 @@ class ImagBehavior(nn.Module):
             succ = dynamics.img_step(state, action)
             if isinstance(succ, tuple):
                 succ = succ[0] # hRSSM returns a tuple of (prior, spatial)
-            
-            succ_detached = {k: [item.detach() for item in v] if isinstance(v, list) else v.detach() for k, v in succ.items()}
-            
-            return succ_detached, feat, action
+
+            if allow_grad:
+                next_state = succ
+            else:
+                next_state = {k: [item.detach() for item in v] if isinstance(v, list) else v.detach() for k, v in succ.items()}
+
+            return next_state, feat, action
 
         succ, feats, actions = tools.static_scan(
             step, [torch.arange(horizon)], (start, None, None)
@@ -438,7 +443,8 @@ class ImagBehavior(nn.Module):
         base,
     ):
         metrics = {}
-        inp = imag_feat.detach()
+        dyn = (self._config.imag_gradient in ["dynamics", "both"])
+        inp = imag_feat if dyn else imag_feat.detach()
         policy = self.actor(inp)
         # Q-val for actor is not transformed using symlog
         target = torch.stack(target, dim=1)
@@ -502,19 +508,26 @@ class ImagBehavior(nn.Module):
 
 class DecoderHead(nn.Module):
     """
-    A simple decoder head that takes the final spatial feature map from the hRSSM
-    and reconstructs the image.
+    Decoder that reconstructs the image from the final spatial feature map.
+    Optionally applies FiLM conditioning from the top-level latent z at the
+    coarsest scale to encourage the decoder to use the hierarchy.
     """
-    def __init__(self, input_channels, output_shape=(3, 64, 64), cnn_sigmoid=False):
+    def __init__(self, input_channels, output_shape=(3, 64, 64), cnn_sigmoid=False,
+                 film_top_level=True, z_top_dim=None):
         super().__init__()
         self._output_shape = output_shape
         self._cnn_sigmoid = cnn_sigmoid
-        # This final convolution maps the spatial features to image channels.
+        self._film_top_level = bool(film_top_level and (z_top_dim is not None))
+        # FiLM MLPs map z_top -> per-channel scale/shift for spatial features
+        if self._film_top_level:
+            self.film_gamma = nn.Linear(int(z_top_dim), int(input_channels))
+            self.film_beta  = nn.Linear(int(z_top_dim), int(input_channels))
+        # Final 1x1 convolution to image channels
         self.conv = nn.Conv2d(input_channels, output_shape[0], kernel_size=1)
         print(f"DecoderHead initialized to output shape {output_shape}.")
-        print(f"Input channels: {input_channels}")
+        print(f"Input channels: {input_channels}, FiLM: {self._film_top_level}")
 
-    def forward(self, spatial_features):
+    def forward(self, spatial_features, z_top=None):
         # Accept (B,T,C,H,W) or (BT,C,H,W)
         if spatial_features.ndim == 5:
             B, T, C, H, W = spatial_features.shape
@@ -529,6 +542,19 @@ class DecoderHead(nn.Module):
         if (H, W) != target_hw:
             x = F.interpolate(x, size=target_hw, mode='bilinear', align_corners=False)
 
+        # Optional FiLM using top-level latent
+        if self._film_top_level and z_top is not None:
+            # z_top: (B,T,Dim) or (BT,Dim)
+            if isinstance(z_top, (list, tuple)):
+                z_top = z_top[-1]
+            if z_top.ndim == 3:
+                zt = z_top.reshape(-1, z_top.shape[-1])
+            else:
+                zt = z_top
+            gamma = self.film_gamma(zt).view(x.shape[0], x.shape[1], 1, 1)
+            beta  = self.film_beta(zt).view(x.shape[0], x.shape[1], 1, 1)
+            x = gamma * x + beta
+
         mean = self.conv(x)  # (BT, C_out, Ht, Wt) with (Ht,Wt)==target_hw
         if len(batch_shape) == 2:
             B, T = batch_shape
@@ -536,8 +562,115 @@ class DecoderHead(nn.Module):
         else:
             mean = mean.reshape(batch_shape[0], 1, *self._output_shape)  # degenerate T=1
 
-        # mean = mean.permute(0, 1, 2, 3, 4)  # (B,T,H,W,C)
-        mean = F.sigmoid(mean) if self._cnn_sigmoid else (mean + 0.5)
+        # Convert to channel-last for image loss: (B,T,C,H,W) -> (B,T,H,W,C)
+        mean = mean.permute(0, 1, 3, 4, 2)
+        mean = torch.sigmoid(mean) if self._cnn_sigmoid else (mean + 0.5)
+        return {'image': tools.MSEDist(mean)}
+
+
+class LadderDecoder(nn.Module):
+    """
+    CNVAE-style ladder decoder:
+    - Start from the coarsest latent z_{L-1} expanded to spatial.
+    - Iteratively upsample and inject lower-level latents z_{l} via concat+1x1 merge.
+    - A few 3x3 conv blocks at each level provide spatial mixing.
+    - Produces final RGB at the finest resolution.
+
+    Inputs at runtime: list of latents per level [z_l] with order finest->coarsest,
+    shaped (B,T,S,K) for discrete or (B,T,S) for continuous. We internally flatten.
+    """
+    def __init__(self,
+                 z_flat_ch,           # list[int], channels after flatten per level (finest->coarsest)
+                 spatial_sizes,       # list[int], spatial size per level (finest->coarsest)
+                 out_shape=(3, 64, 64),
+                 blocks_per_level=2,
+                 up_mode='bilinear',
+                 cnn_sigmoid=False):
+        super().__init__()
+        assert len(z_flat_ch) == len(spatial_sizes)
+        self.L = len(z_flat_ch)
+        self.z_flat_ch = list(z_flat_ch)
+        self.spatial_sizes = list(spatial_sizes)
+        self.out_shape = out_shape
+        self.blocks_per_level = int(blocks_per_level)
+        self.up_mode = up_mode
+        self.cnn_sigmoid = cnn_sigmoid
+
+        # We build ExpandZ to map flat z_l -> (Cz_l, H_l, H_l);
+        # match hRSSM choice: out_ch = z_flat_ch[l].
+        self.expand_z = nn.ModuleList([
+            networks.ExpandZ(in_ch=self.z_flat_ch[l], out_ch=self.z_flat_ch[l], spatial=self.spatial_sizes[l])
+            for l in range(self.L)
+        ])
+
+        # Merge 1x1 to bring concat(prev_feat, z_l_feat) back to z_flat_ch[l].
+        self.merge = nn.ModuleList()
+        self.level_blocks = nn.ModuleList()
+        for l in range(self.L):
+            ch = self.z_flat_ch[l]
+            if l == self.L - 1:
+                in_ch = ch
+            else:
+                in_ch = ch + self.z_flat_ch[l + 1]
+            self.merge.append(nn.Conv2d(in_ch, ch, kernel_size=1))
+            # simple residual-style stack
+            blocks = []
+            for _ in range(self.blocks_per_level):
+                blocks += [nn.Conv2d(ch, ch, kernel_size=3, padding=1), nn.SiLU()]
+            self.level_blocks.append(nn.Sequential(*blocks))
+
+        # Final refinement and 1x1 to image channels.
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(self.z_flat_ch[0], self.z_flat_ch[0], kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(self.z_flat_ch[0], out_shape[0], kernel_size=1),
+        )
+
+    def _BT(self, x):
+        # x: (B,T,...) -> (BT,...)
+        assert x.ndim >= 3
+        B, T = x.shape[:2]
+        return B, T, x.reshape(B * T, *x.shape[2:])
+
+    def _interpolate(self, x, size):
+        if 'linear' in self.up_mode:
+            return F.interpolate(x, size=(size, size), mode=self.up_mode, align_corners=False)
+        return F.interpolate(x, size=(size, size), mode=self.up_mode)
+
+    def forward(self, z_list):
+        # z_list expected finest->coarsest
+        assert isinstance(z_list, (list, tuple)) and len(z_list) == self.L
+        # Extract shapes
+        B, T = z_list[0].shape[0], z_list[0].shape[1]
+        # Work with BT batch
+        def flat_bt(z):
+            z = z.reshape(B * T, -1)
+            return z
+
+        # Start from coarsest
+        l = self.L - 1
+        z_top = flat_bt(z_list[l])
+        feat = self.expand_z[l](z_top)               # (BT, Cz_l, H_l, H_l)
+        feat = self.merge[l](feat)
+        feat = self.level_blocks[l](feat)
+
+        # Progressively add finer levels
+        for l in range(self.L - 2, -1, -1):
+            H = int(self.spatial_sizes[l])
+            if feat.shape[-1] != H:
+                feat = self._interpolate(feat, H)
+            z_flat = flat_bt(z_list[l])
+            z_spat = self.expand_z[l](z_flat)
+            feat = torch.cat([feat, z_spat], dim=1)
+            feat = self.merge[l](feat)
+            feat = self.level_blocks[l](feat)
+
+        # Produce image at finest resolution and reshape back to (B,T,C,H,W)
+        mean = self.final_conv(feat)                  # (BT, C, H0, W0)
+        C, H, W = self.out_shape
+        mean = mean.reshape(B, T, C, H, W)
+        mean = mean.permute(0, 1, 3, 4, 2)           # (B,T,H,W,C)
+        mean = torch.sigmoid(mean) if self.cnn_sigmoid else (mean + 0.5)
         return {'image': tools.MSEDist(mean)}
 
 class hWorldModel(WorldModel):
@@ -552,11 +685,11 @@ class hWorldModel(WorldModel):
         self._amp_dtype = torch.bfloat16 if config.precision == 'bfloat16' else torch.float16
 
         self._config = config
-        
+
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
-        
+
         self.encoder = networks.hConvEncoder(shapes['image'], **config.encoder)
-        
+
         self.dynamics = networks.hRSSM(
             h_encoder_dims=list(self.encoder.out_channels),
             **config.rssm,
@@ -568,15 +701,20 @@ class hWorldModel(WorldModel):
             dyn_std_act=config.dyn_std_act,
             dyn_min_std=config.dyn_min_std,
         )
-        
+
         self.heads = nn.ModuleDict()
 
-        # The decoder head now takes its input from the hRSSM's spatial features
-        spatial_channels = self.dynamics._z_flat_ch[0]
-        self.heads["decoder"] = DecoderHead(
-            spatial_channels, shapes['image'], config.decoder['cnn_sigmoid']
+        # Use LadderDecoder: inject per-level latents in a top-down path
+        H, W, C = shapes['image']
+        self.heads["decoder"] = LadderDecoder(
+            z_flat_ch=self.dynamics._z_flat_ch,              # finest->coarsest
+            spatial_sizes=self.dynamics._spatial_sizes,      # finest->coarsest
+            out_shape=(C, H, W),
+            blocks_per_level=getattr(config, 'ladder_blocks_per_level', 2),
+            up_mode=self.dynamics._up_mode if hasattr(self.dynamics, '_up_mode') else 'bilinear',
+            cnn_sigmoid=config.decoder['cnn_sigmoid'],
         )
-        
+
         self.feat_size = self.dynamics.feat_size() #sum(config.rssm['h_stoch_dims']) + sum(config.rssm['h_deter_dims'])
 
         self.heads["reward"] = networks.MLP(
@@ -606,7 +744,7 @@ class hWorldModel(WorldModel):
 
         for name in config.grad_heads:
             assert name in self.heads, name
-            
+
         self._model_opt = tools.Optimizer(
             "model",
             self.parameters(),
@@ -631,19 +769,30 @@ class hWorldModel(WorldModel):
         with tools.RequiresGrad(self):
             with torch.amp.autocast('cuda', enabled=self._use_amp):
                 embed_list = self.encoder(data)
-                
+
                 # hRSSM.observe now returns the final spatial feature map as the second element
                 post, prior, spatial_post = self.dynamics.observe(
                     embed_list, data["action"], data["is_first"]
                 )
-                
+
+                # Compute capacity schedule (free-bits warmup)
+                if hasattr(self._config, "kl_anneal_steps"):
+                    step_val = float(self._step()) if callable(self._step) else float(self._step)
+                    progress = min(1.0, step_val / max(1.0, float(self._config.kl_anneal_steps)))
+                    # Start from base free (kl_free) and anneal up to kl_free_bits_max
+                    base_free = float(self._config.kl_free)
+                    free_max = float(getattr(self._config, "kl_free_bits_max", base_free))
+                    kl_free_total = base_free + (free_max - base_free) * progress
+                else:
+                    kl_free_total = float(self._config.kl_free)
+
                 kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
-                    post, prior, self._config.kl_free, self._config.dyn_scale, self._config.rep_scale
+                    post, prior, kl_free_total, self._config.dyn_scale, self._config.rep_scale
                 )
-                
+
                 preds = {}
-                # Handle decoder separately as it uses spatial features
-                decoder_pred = self.heads['decoder'](spatial_post)
+                # Ladder decoder consumes per-level latents (finest->coarsest)
+                decoder_pred = self.heads['decoder'](post['stoch'])
                 preds.update(decoder_pred)
 
                 for name, head in self.heads.items():
@@ -653,28 +802,61 @@ class hWorldModel(WorldModel):
                     feat = feat if grad_head else feat.detach()
                     pred = head(feat)
                     preds[name] = pred
-                
+
                 losses = {}
                 for name, pred in preds.items():
                     loss = -pred.log_prob(data[name])
                     losses[name] = loss
-                
+
                 scaled = {
                     key: value * self._scales.get(key, 1.0)
                     for key, value in losses.items()
                 }
                 model_loss = sum(scaled.values()) + kl_loss
-                
+
             metrics = self._model_opt(torch.mean(model_loss), self.parameters())
 
         metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
-        metrics["kl_free"] = self._config.kl_free
+        metrics["kl_free"] = kl_free_total
         metrics["dyn_scale"] = self._config.dyn_scale
         metrics["rep_scale"] = self._config.rep_scale
         metrics["dyn_loss"] = to_np(torch.mean(dyn_loss))
         metrics["rep_loss"] = to_np(torch.mean(rep_loss))
         metrics["kl"] = to_np(torch.mean(kl_value))
-        
+        # Optional per-level logs if available
+        if hasattr(self.dynamics, "_kl_debug"):
+            dbg = self.dynamics._kl_debug
+            for i, v in enumerate(dbg["dyn_means"]):
+                metrics[f"kl_dyn_l{i}"] = to_np(v)
+            for i, v in enumerate(dbg["rep_means"]):
+                metrics[f"kl_rep_l{i}"] = to_np(v)
+            for i, v in enumerate(dbg["ema_dyn"]):
+                metrics[f"kl_ema_dyn_l{i}"] = to_np(v)
+            for i, v in enumerate(dbg["ema_rep"]):
+                metrics[f"kl_ema_rep_l{i}"] = to_np(v)
+            for i, v in enumerate(dbg["gamma_dyn"]):
+                metrics[f"kl_gamma_dyn_l{i}"] = to_np(v)
+            for i, v in enumerate(dbg["gamma_rep"]):
+                metrics[f"kl_gamma_rep_l{i}"] = to_np(v)
+        # Log what feature exposure the actor/value see as a numeric index for scalars
+        level_cfg = None
+        if hasattr(self._config, 'rssm'):
+            level_cfg = self._config.rssm if isinstance(self._config.rssm, dict) else getattr(self._config.rssm, 'expose_levels', 'all')
+        if isinstance(level_cfg, dict):
+            level = level_cfg.get('expose_levels', 'all')
+        else:
+            level = level_cfg if level_cfg is not None else 'all'
+        if level == 'all':
+            idx = -1.0  # -1 means all levels
+        elif level == 'top':
+            idx = float(getattr(self.dynamics, '_h_levels', 1) - 1)
+        else:
+            try:
+                idx = float(int(level))
+            except Exception:
+                idx = -1.0
+        metrics["actor_feat_index"] = idx
+
         post_detached = {k: (v if not isinstance(v, list) else [i.detach() for i in v]) for k, v in post.items()}
         return post_detached, {}, metrics
 
@@ -683,8 +865,8 @@ class hWorldModel(WorldModel):
     #     z = sum(d * self._discrete if self._discrete else d
     #             for d in self._h_stoch_dims)
     #     d = sum(self._h_deter_dims)
-    #     return z + d 
-    
+    #     return z + d
+
     def preprocess(self, obs):
         obs = {
             k: (v.clone().detach().to(device=self._config.device, dtype=torch.float32)
@@ -699,30 +881,30 @@ class hWorldModel(WorldModel):
         assert "is_terminal" in obs
         obs["cont"] = (1.0 - obs["is_terminal"]).unsqueeze(-1)
         obs["image"] = obs["image"] / 255.0  # image normalized ot [0, 1]
-        
+
         return obs
 
     def video_pred(self, data):
         data = self.preprocess(data)
-        
+
         # Get initial state from a short context sequence
         context_len = 5
         embed_list = self.encoder(data)
-        states, prior, spatial_states = self.dynamics.observe(
-            [e[:, :context_len] for e in embed_list], 
-            data["action"][:, :context_len], 
+        states, _, _ = self.dynamics.observe(
+            [e[:, :context_len] for e in embed_list],
+            data["action"][:, :context_len],
             data["is_first"][:, :context_len]
         )
-        
-        # Get reconstructions for the context part
-        recon = self.heads["decoder"](spatial_states)['image'].mode()
-        
+
+        # Reconstructions for the context using ladder decoder (consume post latents)
+        recon = self.heads["decoder"](states['stoch']).mode()
+
         # Get the last state to start imagination from
         init_state = {k: (v[:, -1] if not isinstance(v, list) else [vi[:, -1] for vi in v]) for k, v in states.items()}
 
         # Imagine the future
-        prior_states, spatial_priors = self.dynamics.imagine_with_action(data["action"][:, context_len:], init_state)
-        openl = self.heads["decoder"](spatial_priors)['image'].mode()
+        priors, _ = self.dynamics.imagine_with_action(data["action"][:, context_len:], init_state)
+        openl = self.heads["decoder"](priors['stoch']).mode()
 
         # Combine context reconstructions and open-loop predictions
         model = torch.cat([recon, openl], 1)

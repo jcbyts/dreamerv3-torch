@@ -183,7 +183,7 @@ class RSSM(nn.Module):
         # overwrite the prev_state only where is_first=True
         elif torch.sum(is_first) > 0:
             is_first = is_first[:, None]
-            prev_action *= 1.0 - is_first
+            prev_action = prev_action * (1.0 - is_first)
             init_state = self.initial(len(is_first))
             for key, val in prev_state.items():
                 is_first_r = torch.reshape(
@@ -263,7 +263,7 @@ class RSSM(nn.Module):
                 "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
             }[self._mean_act]()
             std = {
-                "softplus": lambda: torch.softplus(std),
+                "softplus": lambda: F.softplus(std),
                 "abs": lambda: torch.abs(std + 1),
                 "sigmoid": lambda: torch.sigmoid(std),
                 "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
@@ -818,67 +818,40 @@ class ImgChLayerNorm(nn.Module):
 # New hRSSM
 # ----------------------------------------------------------------
 class BlockDiagGRUCell(nn.Module):
-    """
-    Block-diagonal GRU cell as provided. Each block will correspond to a
-    level in the hierarchy, allowing for parallel state updates.
-    """
-    def __init__(self, inp_size, size, blocks, norm=True, act=torch.tanh, update_bias=-1):
+    def __init__(self, inp_size, size, blocks, norm=True, act=torch.tanh, update_bias=-1.0):
         super().__init__()
         assert size % blocks == 0
         self.size, self.blocks, self.b = size, blocks, size // blocks
         self.act, self.update_bias = act, update_bias
 
-        self.Wx = nn.Linear(inp_size, 3*size, bias=False)
-        self.Wrec = nn.Parameter(torch.empty(blocks, self.b, 3*self.b))
+        self.Wx = nn.Linear(inp_size, 3 * size, bias=False)
+        self.Wrec = nn.Parameter(torch.empty(blocks, self.b, 3 * self.b))
         nn.init.xavier_uniform_(self.Wrec)
 
-        # Use stateless LayerNorm (no learnable affine parameters) to avoid sharing issues
-        self.ln = nn.LayerNorm(3*size, eps=1e-3, elementwise_affine=False) if norm else None
-    
-    
-    def forward(self, x, state):
-        h = state[0]
-        N = h.shape[0]
-        hB = h.view(N, self.blocks, self.b)
+        self.ln = nn.LayerNorm(3 * size, eps=1e-3, elementwise_affine=False) if norm else None
 
-        parts = self.Wx(x)
-        parts_rec = torch.einsum('nkb,kbc->nkc', hB, self.Wrec).reshape(N, 3*self.size)
-        parts = parts + parts_rec
+    def forward(self, x, state):
+        h = state[0]                                # (N, size)
+        N = h.shape[0]
+        hB = h.reshape(N, self.blocks, self.b)      # (N, K, b)
+
+        # Input + recurrent
+        parts = self.Wx(x)                          # (N, 3*size)
+        parts_rec = torch.matmul(hB, self.Wrec)     # (N, K, 3b)
+        parts = parts + parts_rec.reshape(N, 3 * self.size)
+
         if self.ln is not None:
-            # Use stateless LayerNorm (no learnable parameters to share)
             parts = self.ln(parts)
 
-        r, c, z = torch.split(parts, self.size, dim=-1)
+        r, c, z = parts.chunk(3, dim=-1)
         r = torch.sigmoid(r)
-        c = self.act(r * c)
+        c = self.act(r * c)                         # variant uses r on full preact; intentional
         z = torch.sigmoid(z + self.update_bias)
-        h_new = z * c + (1 - z) * h
+
+        h_new = z * c + (1.0 - z) * h.clone()               # no clone needed
         return h_new, [h_new]
-    
-    # def forward(self, x, state):# NEW
-    #     h = state[0]
-    #     N = h.shape[0]
-    #     hB = h.view(N, self.blocks, self.b)
 
-    #     parts = self.Wx(x)
-    #     parts_rec = torch.einsum('nkb,kbc->nkc', hB, self.Wrec).reshape(N, 3*self.size)
-    #     parts = parts + parts_rec
-    #     if self.ln is not None:
-    #         parts = self.ln(parts)
 
-    #     r, c, z = torch.split(parts, self.size, dim=-1)
-    #     r = torch.sigmoid(r)
-    #     c = self.act(r * c)
-    #     z = torch.sigmoid(z + self.update_bias)
-
-    #     # Original line:
-    #     # h_new = z * c + (1 - z) * h
-        
-    #     # Corrected, explicitly safe line:
-    #     h_new = z * c + (1 - z) * h.clone()
-
-    #     return h_new, [h_new]
-    
 class _ProductDist:
     """Treats a list of independent distributions as one big factored dist."""
     def __init__(self, dists):
@@ -945,7 +918,7 @@ class hConvEncoder(nn.Module):
         curr_in  = in_ch
         curr_out = depth
         for i in range(pre_downs):
-            
+
             block = nn.Sequential(
                 Conv2dSamePad(curr_in, curr_out, kernel_size=kernel_size, stride=2, bias=False),
                 ImgChLayerNorm(curr_out) if norm else nn.Identity(),
@@ -955,7 +928,7 @@ class hConvEncoder(nn.Module):
             curr_in = curr_out
             if grow_channels:
                 curr_out *= 2
-        
+
         self.stem = nn.Sequential(*pre)
 
         # Build the `levels` downsampling blocks. Each produces one output.
@@ -999,7 +972,7 @@ class hConvEncoder(nn.Module):
             pass  # Already correct shape
         else:
             raise ValueError(f"Expected 3D, 4D or 5D image tensor, got {x.ndim}D")
-        
+
         BT = B * T
         x = x.reshape(BT, H, W, C)                       # (BT,H,W,C)
         x = x.permute(0, 3, 1, 2)                             # (BT,C,H,W)
@@ -1024,22 +997,25 @@ class ExpandZ(nn.Module):
     """
     def __init__(self, in_ch, out_ch, spatial, norm=True, act="SiLU"):
         super().__init__()
-        self.deconv = nn.ConvTranspose2d(
-            in_channels=in_ch,
-            out_channels=out_ch,
-            kernel_size=spatial,  # 1x1 -> HxH in one shot
-            stride=1,
-            padding=0,
-            bias=False,
-        )
+        self.H = int(spatial)
+        self.seed_hw = 8 if self.H >= 16 else 4
+        hidden = max(out_ch, in_ch)
+        self.fc = nn.Linear(in_ch, hidden * self.seed_hw * self.seed_hw, bias=False)
+        # scale factor guaranteed integer in our settings (H is power-of-two multiples)
+        self.up = nn.Upsample(scale_factor=self.H // self.seed_hw, mode="bilinear", align_corners=False)
+        self.proj = nn.Conv2d(hidden, out_ch, kernel_size=1, bias=False)
         self.norm = ImgChLayerNorm(out_ch) if norm else nn.Identity()
         self.act = getattr(nn, act)()
 
     def forward(self, z):
-        # z: (B, C) or (B, C, 1, 1)
-        if z.dim() == 2:
-            z = z[:, :, None, None]
-        x = self.deconv(z)
+        # Accept (B, C) or (B, C, 1, 1)
+        if z.dim() == 4:
+            z = z[..., 0, 0]
+        B = z.shape[0]
+        x = self.fc(z).view(B, -1, self.seed_hw, self.seed_hw)
+        if self.seed_hw != self.H:
+            x = self.up(x)
+        x = self.proj(x)
         x = self.norm(x)
         x = self.act(x)
         return x
@@ -1111,7 +1087,7 @@ class CompressShared(nn.Module):
         h = self.flat(h)      # -> (B, hidden_ch)
         h = self.fc(h)        # -> (B, out_dim)
         return h
-    
+
 class hRSSM(RSSM):
     def __init__(
         self,
@@ -1125,7 +1101,7 @@ class hRSSM(RSSM):
         up_mode="nearest",
         **kwargs
     ):
-        nn.Module.__init__(self)
+        super().__init__()
         # ----- core config copied from RSSM ---------------------------------
         self._discrete     = kwargs.get("discrete", False)  # K categories or False
         self._unimix_ratio = kwargs.get("unimix_ratio", 0.01)
@@ -1136,6 +1112,7 @@ class hRSSM(RSSM):
         self._std_act      = kwargs.get("std_act", "sigmoid2")
         self._min_std      = kwargs.get("min_std", 0.1)
         self._expose_levels = kwargs.get("expose_levels", "all")
+        self._gumbel_tau   = float(kwargs.get("gumbel_tau_init", 1.0))
 
         # ----- hierarchy sizes ---------------------------------------------
         self._h_levels       = h_levels
@@ -1236,16 +1213,32 @@ class hRSSM(RSSM):
 
         # ----- learned initial deter ---------------------------------------
         if self._initial == "learned":
-            self.W = torch.nn.Parameter(
-                torch.zeros((1, self._deter), device=torch.device(self._device)),
-                requires_grad=True,
-            )
+            # Device-agnostic; will be moved by .to(device)
+            self.W = torch.nn.Parameter(torch.zeros((1, self._deter)), requires_grad=True)
 
         # ----- init weights -------------------------------------------------
         self.apply(tools.weight_init)
         print("hRSSM (shared spatial compressor + expand_z + up2x) initialised.")
 
-    
+        # ---- KL balancing and soft free-bits configuration --------------------
+        self._kl_balancing = kwargs.get("kl_balancing", False)
+        self._kl_balancer = kwargs.get("kl_balancer", "equal")  # ['equal','sqrt','square']
+        self._kl_balance_momentum = float(kwargs.get("kl_balance_momentum", 0.05))
+        self._kl_soft_tau = float(kwargs.get("kl_soft_tau", 0.1))
+        # Stateful EMAs per level (seed with small positive to avoid early spikes/div-by-zero)
+        init_ema = torch.full((self._h_levels,), 0.1)
+        self.register_buffer("kl_ema_dyn", init_ema.clone())
+        self.register_buffer("kl_ema_rep", init_ema.clone())
+        # Optional gamma clipping for stability
+        self._kl_gamma_clip_min = float(kwargs.get("kl_gamma_clip_min", 0.0))
+        self._kl_gamma_clip_max = float(kwargs.get("kl_gamma_clip_max", 0.0))
+
+        # Under-target penalty strength (dual ascent light)
+        self._kl_under_penalty = float(kwargs.get("kl_under_penalty", 0.0))
+
+
+
+
     def feat_size(self):
         """
         Calculate the number of channels in the feature output
@@ -1266,33 +1259,34 @@ class hRSSM(RSSM):
             total_channels += level_channels
 
         return total_channels
-    
+
     def _flat_z(self, z):
         if self._discrete and z.ndim >= 3:
             # Generalize flattening for tensors of 3D (B, S, D) or 4D (B, T, S, D)
             # This reshapes the last two dimensions (stochastic and discrete) into one.
             return z.reshape(*z.shape[:-2], -1)
         return z
-    
+
     def initial(self, batch_size):
-        deter = torch.zeros(batch_size, self._deter, device=self._device)
+        dev = next(self.parameters()).device
+        deter = torch.zeros(batch_size, self._deter, device=dev)
         if self._initial == "learned":
-            deter = torch.tanh(self.W).repeat(batch_size, 1)
+            deter = torch.tanh(self.W.to(dev)).repeat(batch_size, 1)
         if self._discrete:
             state = {
-                'logit': [torch.zeros([batch_size, d, self._discrete], device=self._device) for d in self._h_stoch_dims],
-                'stoch': [torch.zeros([batch_size, d, self._discrete], device=self._device) for d in self._h_stoch_dims],
+                'logit': [torch.zeros([batch_size, d, self._discrete], device=dev) for d in self._h_stoch_dims],
+                'stoch': [torch.zeros([batch_size, d, self._discrete], device=dev) for d in self._h_stoch_dims],
                 'deter': deter,
             }
         else:
             state = {
-                'mean': [torch.zeros([batch_size, d], device=self._device) for d in self._h_stoch_dims],
-                'std': [torch.ones([batch_size, d], device=self._device) for d in self._h_stoch_dims],
-                'stoch': [torch.zeros([batch_size, d], device=self._device) for d in self._h_stoch_dims],
+                'mean': [torch.zeros([batch_size, d], device=dev) for d in self._h_stoch_dims],
+                'std': [torch.ones([batch_size, d], device=dev) for d in self._h_stoch_dims],
+                'stoch': [torch.zeros([batch_size, d], device=dev) for d in self._h_stoch_dims],
                 'deter': deter,
             }
         return state
-    
+
     def img_step(self, prev_state, prev_action, sample=True):
         """
         Prior ladder (coarse -> fine) using shared compressor without encoder.
@@ -1324,20 +1318,20 @@ class hRSSM(RSSM):
         # 2) containers
         prior_stoch = [None] * L
         if self._discrete:
-            prior_stats = {"logit": []}
+            prior_stats = {"logit": [None]*L}
         else:
-            prior_stats = {"mean": [], "std": []}
+            prior_stats = {"mean": [None]*L, "std": [None]*L}
 
         # 3) level L-1 (coarsest)
         l = L - 1
         H = self._spatial_sizes[l]
-        deter_img = deter_split[l].view(B, -1, 1, 1).expand(B, -1, H, H)  # (B, D_l, H, H)
-        core = deter_img                                                   # no parent feature at coarsest
-        stats_vec = self.compress[l](core, enc=None)                       # (B, out_dim_l)
+        deter_img = deter_split[l].reshape(B, -1, 1, 1).expand(B, -1, H, H)
+        core = deter_img
+        stats_vec = self.compress[l](core, enc=None)
 
         # parse stats -> dist -> sample z_l (flat)
         if self._discrete:
-            logit = stats_vec.view(B, self._h_stoch_dims[l], K)
+            logit = stats_vec.reshape(B, self._h_stoch_dims[l], K)
             stats = {"logit": logit}
         else:
             mean, std = torch.split(stats_vec, self._h_stoch_dims[l], dim=-1)
@@ -1349,11 +1343,14 @@ class hRSSM(RSSM):
                 "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
             }[self._std_act]() + self._min_std
             stats = {"mean": mean, "std": std}
-        z = self.get_dist_h(stats).sample() if sample else self.get_dist_h(stats).mode()
+        dist = self.get_dist_h(stats)
+        z = dist.rsample() if (sample and hasattr(dist, 'rsample')) else (dist.sample() if sample else dist.mode())
         prior_stoch[l] = z
-        for k, v in stats.items():
-            prior_stats.setdefault(k, [])
-            prior_stats[k].insert(0 if l == 0 else 0, v)  # maintain list shape; exact position not used later by name
+        if self._discrete:
+            prior_stats["logit"][l] = logit
+        else:
+            prior_stats["mean"][l] = mean
+            prior_stats["std"][l]  = std
 
         # spatial parent for next (finer) level: expand z_l to (H,H), then up2x when moving down
         parent_spatial = self.expand_z[l](self._flat_z(z))                 # (B, Cz_l, H, H)
@@ -1361,15 +1358,15 @@ class hRSSM(RSSM):
         # 4) levels L-2 ... 0 (coarse -> fine)
         for l in range(L - 2, -1, -1):
             # upsample parent feature to current level resolution
-            parent_spatial = self.up2x[l](parent_spatial)                  # (B, Cz_{l+1}, H_l, H_l)
+            parent_spatial = self.up2x[l](parent_spatial)
 
             H = self._spatial_sizes[l]
-            deter_img = deter_split[l].view(B, -1, 1, 1).expand(B, -1, H, H)   # (B, D_l, H, H)
-            core = torch.cat([deter_img, parent_spatial], dim=1)               # (B, D_l + Cz_{l+1}, H, H)
+            deter_img = deter_split[l].reshape(B, -1, 1, 1).expand(B, -1, H, H)
+            core = torch.cat([deter_img, parent_spatial], dim=1)
 
-            stats_vec = self.compress[l](core, enc=None)                       # (B, out_dim_l)
+            stats_vec = self.compress[l](core, enc=None)
             if self._discrete:
-                logit = stats_vec.view(B, self._h_stoch_dims[l], K)
+                logit = stats_vec.reshape(B, self._h_stoch_dims[l], K)
                 stats = {"logit": logit}
             else:
                 mean, std = torch.split(stats_vec, self._h_stoch_dims[l], dim=-1)
@@ -1382,13 +1379,16 @@ class hRSSM(RSSM):
                 }[self._std_act]() + self._min_std
                 stats = {"mean": mean, "std": std}
 
-            z = self.get_dist_h(stats).sample() if sample else self.get_dist_h(stats).mode()
+            dist = self.get_dist_h(stats)
+            z = dist.rsample() if (sample and hasattr(dist, 'rsample')) else (dist.sample() if sample else dist.mode())
             prior_stoch[l] = z
-            for k, v in stats.items():
-                prior_stats[k].insert(0, v)
+            if self._discrete:
+                prior_stats["logit"][l] = logit
+            else:
+                prior_stats["mean"][l] = mean
+                prior_stats["std"][l]  = std
 
-            # refresh parent feature for the next finer level
-            parent_spatial = self.expand_z[l](self._flat_z(z))                 # (B, Cz_l, H, H)
+            parent_spatial = self.expand_z[l](self._flat_z(z))
 
         prior = {"stoch": prior_stoch, "deter": deter, **prior_stats}
 
@@ -1415,10 +1415,10 @@ class hRSSM(RSSM):
         elif torch.any(is_first):
             # Create a mask from the is_first tensor to zero out actions and states.
             mask = (1 - is_first).float().unsqueeze(-1)
-            
+
             # Create a new action tensor instead of modifying in-place.
             prev_action = prev_action * mask
-            
+
             # Create a new state dictionary to avoid modifying the original.
             new_state = {}
             init_state = self.initial(len(is_first))
@@ -1455,21 +1455,20 @@ class hRSSM(RSSM):
         # Containers for posterior
         post_stoch = [None] * L
         if self._discrete:
-            post_stats = {"logit": []}
+            post_stats = {"logit": [None]*L}
         else:
-            post_stats = {"mean": [], "std": []}
+            post_stats = {"mean": [None]*L, "std": [None]*L}
 
         # Level L-1 (coarsest)
         l = L - 1
-        enc_feat = embeds[l]                                         # (B, E_l, H, H)
+        enc_feat = embeds[l]
         H = enc_feat.shape[-1]
-        deter_img = deter_split[l].view(B, -1, 1, 1).expand(B, -1, H, H)
-        core = deter_img                                             # no parent feature at coarsest
-        stats_vec = self.compress[l](core, enc=enc_feat)             # (B, out_dim_l)
+        deter_img = deter_split[l].reshape(B, -1, 1, 1).expand(B, -1, H, H)
+        core = deter_img
+        stats_vec = self.compress[l](core, enc=enc_feat)
 
-        # parse -> dist -> sample
         if self._discrete:
-            logit = stats_vec.view(B, self._h_stoch_dims[l], K)
+            logit = stats_vec.reshape(B, self._h_stoch_dims[l], K)
             stats = {"logit": logit}
         else:
             mean, std = torch.split(stats_vec, self._h_stoch_dims[l], dim=-1)
@@ -1481,11 +1480,14 @@ class hRSSM(RSSM):
                 "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
             }[self._std_act]() + self._min_std
             stats = {"mean": mean, "std": std}
-        z = self.get_dist_h(stats).sample() if sample else self.get_dist_h(stats).mode()
+        dist = self.get_dist_h(stats)
+        z = dist.rsample() if (sample and hasattr(dist, 'rsample')) else (dist.sample() if sample else dist.mode())
         post_stoch[l] = z
-        for k, v in stats.items():
-            post_stats.setdefault(k, [])
-            post_stats[k].insert(0 if l == 0 else 0, v)
+        if self._discrete:
+            post_stats["logit"][l] = logit
+        else:
+            post_stats["mean"][l] = mean
+            post_stats["std"][l]  = std
 
         parent_spatial = self.expand_z[l](self._flat_z(z))           # (B, Cz_l, H, H)
 
@@ -1498,11 +1500,11 @@ class hRSSM(RSSM):
             H = enc_feat.shape[-1]
             deter_img = deter_split[l].view(B, -1, 1, 1).expand(B, -1, H, H)
 
-            core = torch.cat([deter_img, parent_spatial], dim=1)     # (B, D_l + Cz_{l+1}, H, H)
-            stats_vec = self.compress[l](core, enc=enc_feat)         # (B, out_dim_l)
+            core = torch.cat([deter_img, parent_spatial], dim=1)
+            stats_vec = self.compress[l](core, enc=enc_feat)
 
             if self._discrete:
-                logit = stats_vec.view(B, self._h_stoch_dims[l], K)
+                logit = stats_vec.reshape(B, self._h_stoch_dims[l], K)
                 stats = {"logit": logit}
             else:
                 mean, std = torch.split(stats_vec, self._h_stoch_dims[l], dim=-1)
@@ -1515,12 +1517,16 @@ class hRSSM(RSSM):
                 }[self._std_act]() + self._min_std
                 stats = {"mean": mean, "std": std}
 
-            z = self.get_dist_h(stats).sample() if sample else self.get_dist_h(stats).mode()
+            dist = self.get_dist_h(stats)
+            z = dist.rsample() if (sample and hasattr(dist, 'rsample')) else (dist.sample() if sample else dist.mode())
             post_stoch[l] = z
-            for k, v in stats.items():
-                post_stats[k].insert(0, v)
+            if self._discrete:
+                post_stats["logit"][l] = logit
+            else:
+                post_stats["mean"][l] = mean
+                post_stats["std"][l]  = std
 
-            parent_spatial = self.expand_z[l](self._flat_z(z))       # (B, Cz_l, H, H)
+            parent_spatial = self.expand_z[l](self._flat_z(z))
 
         # Package outputs
         if self._discrete:
@@ -1549,7 +1555,7 @@ class hRSSM(RSSM):
         prior_seq = {k: (unswap(v) if not isinstance(v, list) else [unswap(x) for x in v]) for k, v in prior_seq_T.items()}
         spatial_seq = unswap(spatial_seq_T)
         return post_seq, prior_seq, spatial_seq
-    
+
     # def imagine_with_action(self, action, state):
     #     # action: (B,T,A), state: dict of current posterior (B, ...)
     #     swap = lambda x: x.permute([1,0] + list(range(2, x.ndim)))
@@ -1577,7 +1583,7 @@ class hRSSM(RSSM):
             state_dict = prev_state[0]
             prior_t, spatial_t = self.img_step(state_dict, act_t, sample=sample)
             return prior_t, spatial_t
-        
+
         results = tools.static_scan(step, [action_T], (state,))
         priors_T, spatials_T = results
 
@@ -1588,18 +1594,37 @@ class hRSSM(RSSM):
         }
         spatial_seq = unswap(spatials_T)
         return prior_seq, spatial_seq
-    
+
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
+        """Per-level KL with optional EMA-based balancing and soft free-bits.
+        Args:
+          free: total free-bits capacity (float scalar). We keep a uniform per-level
+                floor = free / L but do not zero gradients (soft free-bits).
+        Returns:
+          loss: (B,T) total scaled KL loss used for optimization
+          kl_value: (B,T) unclipped total KL for logging
+          dyn_loss, rep_loss: (B,T) components after weighting
+        """
         kld = torchd.kl.kl_divergence
         sg = lambda x: {k: v.detach() if isinstance(v, torch.Tensor) else [vi.detach() for vi in v] for k, v in x.items()}
+        L = self._h_levels
 
-        # Distribute the free bits equally across all hierarchy levels for proper KL balancing
-        free_per_level = free / self._h_levels
+        # helper: soft free-bits with temperature tau (no dead zone)
+        def soft_free(x, floor, _=None):
+            # floor can be float; ensure tensor on correct device
+            if not torch.is_tensor(floor):
+                floor = torch.as_tensor(floor, device=x.device, dtype=x.dtype)
+            # τ * softplus((x - floor)/τ) + floor
+            return floor + self._kl_soft_tau * F.softplus((x - floor) / max(self._kl_soft_tau, 1e-6))
 
-        dyn_loss_list, rep_loss_list, kl_value_list = [], [], []
+        free_per_level = float(free) / float(L)
 
-        for i in range(self._h_levels):
-            # Extract level-specific stats (only the fields that are lists)
+        # Accumulators
+        dyn_list, rep_list, kl_unclip_list = [], [], []
+        dyn_mean_list, rep_mean_list = [], []
+
+        for i in range(L):
+            # Extract level-specific stats
             post_level = {k: v[i] for k, v in post.items() if isinstance(v, list)}
             prior_level = {k: v[i] for k, v in prior.items() if isinstance(v, list)}
             prior_level_sg = {k: v[i] for k, v in sg(prior).items() if isinstance(v, list)}
@@ -1609,24 +1634,98 @@ class hRSSM(RSSM):
             prior_dist = self.get_dist_h(prior_level)
             prior_dist_sg = self.get_dist_h(prior_level_sg)
             post_dist_sg = self.get_dist_h(post_level_sg)
+            # unwrap ContDist to its base distribution for KL
+            unwrap = lambda d: d._dist if hasattr(d, "_dist") else d
 
-            # Calculate KL divergence for the current level
-            dyn_loss_level = kld(post_dist_sg, prior_dist)
-            rep_loss_level = kld(post_dist, prior_dist_sg)
+            # Unclipped per-level KLs
+            dyn_i = kld(unwrap(post_dist_sg), unwrap(prior_dist))
+            rep_i = kld(unwrap(post_dist), unwrap(prior_dist_sg))
+            kl_unclip_list.append(kld(unwrap(post_dist), unwrap(prior_dist)))
 
-            # Apply free bits clipping to each level individually (proper KL balancing)
-            dyn_loss_list.append(torch.clip(dyn_loss_level, min=free_per_level))
-            rep_loss_list.append(torch.clip(rep_loss_level, min=free_per_level))
+            # Means for EMA (scalar)
+            dyn_mean_list.append(dyn_i.mean())
+            rep_mean_list.append(rep_i.mean())
 
-            # Keep the original, unclipped value for logging/metrics
-            kl_value_list.append(kld(post_dist, prior_dist))
+            # Soft free-bits per level
+            dyn_list.append(soft_free(dyn_i, free_per_level, self._kl_soft_tau))
+            rep_list.append(soft_free(rep_i, free_per_level, self._kl_soft_tau))
 
-        # Sum the clipped values (proper KL balancing: clip first, then sum)
-        dyn_loss = torch.stack(dyn_loss_list, dim=0).sum(0)
-        rep_loss = torch.stack(rep_loss_list, dim=0).sum(0)
-        kl_value = torch.stack(kl_value_list, dim=0).sum(0)
+        # Update EMAs (stateful) if enabled
+        with torch.no_grad():
+            alpha = float(self._kl_balance_momentum)
+            if self._kl_balancing:
+                # Move to device and dtype properly
+                ema_dyn = self.kl_ema_dyn
+                ema_rep = self.kl_ema_rep
+                dyn_means = torch.stack(dyn_mean_list).detach()
+                rep_means = torch.stack(rep_mean_list).detach()
+                if ema_dyn.device != dyn_means.device:
+                    ema_dyn = ema_dyn.to(dyn_means.device)
+                    ema_rep = ema_rep.to(rep_means.device)
+                    self.kl_ema_dyn.data.copy_(ema_dyn)
+                    self.kl_ema_rep.data.copy_(ema_rep)
+                self.kl_ema_dyn.mul_(1.0 - alpha).add_(alpha * dyn_means)
+                self.kl_ema_rep.mul_(1.0 - alpha).add_(alpha * rep_means)
+
+                # Compute gamma from EMAs
+                eps = 1e-6
+                inv_dyn = 1.0 / (self.kl_ema_dyn.clamp_min(eps))
+                inv_rep = 1.0 / (self.kl_ema_rep.clamp_min(eps))
+                def shape_transform(x):
+                    if self._kl_balancer == "sqrt":
+                        return torch.sqrt(x)
+                    if self._kl_balancer == "square":
+                        return x * x
+                    return x
+                g_dyn = shape_transform(inv_dyn)
+                g_rep = shape_transform(inv_rep)
+                # Normalize so sum = L, then optional clamp for stability
+                g_dyn = L * g_dyn / g_dyn.sum().clamp_min(eps)
+                g_rep = L * g_rep / g_rep.sum().clamp_min(eps)
+                if self._kl_gamma_clip_min > 0.0 or self._kl_gamma_clip_max > 0.0:
+                    lo = self._kl_gamma_clip_min if self._kl_gamma_clip_min > 0 else -float('inf')
+                    hi = self._kl_gamma_clip_max if self._kl_gamma_clip_max > 0 else float('inf')
+                    g_dyn = g_dyn.clamp(min=lo, max=hi)
+                    g_rep = g_rep.clamp(min=lo, max=hi)
+                # Stash for logging
+                self._kl_gamma_dyn = g_dyn.detach().clone()
+                self._kl_gamma_rep = g_rep.detach().clone()
+            else:
+                self._kl_gamma_dyn = torch.ones(L, device=self.kl_ema_dyn.device)
+                self._kl_gamma_rep = torch.ones(L, device=self.kl_ema_rep.device)
+
+        # Weighted sum over levels; support any downstream KL shape (e.g., (B,) or (T,B))
+        dyn_stack = torch.stack(dyn_list, 0)
+        rep_stack = torch.stack(rep_list, 0)
+        kl_stack  = torch.stack(kl_unclip_list, 0)
+        # Expand gammas to match dyn_stack.ndim
+        expand_shape = [1] * (dyn_stack.ndim - 1)
+        g_dyn_bt = self._kl_gamma_dyn.view(L, *expand_shape)
+        g_rep_bt = self._kl_gamma_rep.view(L, *expand_shape)
+        dyn_loss = (dyn_stack * g_dyn_bt).sum(0)
+        rep_loss = (rep_stack * g_rep_bt).sum(0)
+        kl_value = kl_stack.sum(0)
+
+        # Optional under-target penalty: encourage KL_i >= free_per_level
+        if self._kl_under_penalty > 0.0:
+            # Compute mean per-level unclipped KLs and penalty on deficit
+            per_level_means = kl_stack.mean(dim=tuple(range(1, kl_stack.ndim)))  # (L,)
+            deficit = (free_per_level - per_level_means).clamp_min(0.0)
+            penalty = self._kl_under_penalty * deficit.sum()
+            # Broadcast penalty as a scalar added to every (B,T) position
+            dyn_loss = dyn_loss + 0.0 * dyn_loss + penalty
 
         loss = dyn_scale * dyn_loss + rep_scale * rep_loss
+
+        # Prepare debug stats for logging at caller
+        self._kl_debug = {
+            "dyn_means": torch.stack(dyn_mean_list).detach(),
+            "rep_means": torch.stack(rep_mean_list).detach(),
+            "ema_dyn": self.kl_ema_dyn.detach().clone(),
+            "ema_rep": self.kl_ema_rep.detach().clone(),
+            "gamma_dyn": self._kl_gamma_dyn.detach().clone(),
+            "gamma_rep": self._kl_gamma_rep.detach().clone(),
+        }
         return loss, kl_value, dyn_loss, rep_loss
 
     def get_feat(self, state):
@@ -1638,53 +1737,30 @@ class hRSSM(RSSM):
             return torch.cat([stoch_flat, state['deter']], -1)
         elif self._expose_levels == 'top':
             return torch.cat([stoch_list_flat[-1], torch.split(state['deter'], self._h_deter_dims, dim=-1)[-1]], -1)
+        elif isinstance(self._expose_levels, str) and ',' in self._expose_levels:
+            idxs = [int(s) for s in self._expose_levels.split(',')]
+            deter_split = torch.split(state['deter'], self._h_deter_dims, dim=-1)
+            stoch_flat = torch.cat([stoch_list_flat[i] for i in idxs], -1)
+            deter_cat  = torch.cat([deter_split[i] for i in idxs], -1)
+            return torch.cat([stoch_flat, deter_cat], -1)
         else:
             level_idx = int(self._expose_levels)
             return torch.cat([stoch_list_flat[level_idx], torch.split(state['deter'], self._h_deter_dims, dim=-1)[level_idx]], -1)
-    
+
     def get_dist_h(self, state_level):
         if self._discrete:
             logit = state_level["logit"]
-            # The Independent wrapper is the key fix. It sums over the last dimension.
+            # Use OneHotDist with temperature; ContDist wrapper supports rsample if provided
             dist = torchd.independent.Independent(
-                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
+                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio, temperature=getattr(self, '_gumbel_tau', 1.0)), 1
             )
             return dist
         else:
             mean, std = state_level["mean"], state_level["std"]
             return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(mean, std), 1))
-        
-    # def get_dist_h(self, state_level):
-    #     if self._discrete:
-    #         logit = state_level["logit"]
-    #         return tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio)
-    #     else:
-    #         mean, std = state_level["mean"], state_level["std"]
-    #         return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(mean, std), 1))
-    
+
     def get_dist(self, full_state):
         dists = [self.get_dist_h({k: (v[i] if isinstance(v, list) else v)
                                 for k, v in full_state.items()})
                 for i in range(self._h_levels)]
         return _ProductDist(dists)
-
-    # def _suff_stats_layer_h(self, layer, x, stoch_dim):
-    #     stats = layer(x)
-    #     if stats.ndim == 4:
-    #         stats = stats.flatten(start_dim=1)
-    #     if self._discrete:
-    #         logit = stats.view(stats.shape[0], stoch_dim, self._discrete)
-    #         return {"logit": logit}
-    #     else:
-    #         mean, std = torch.split(stats, stoch_dim, dim=-1)
-    #         mean = {
-    #             "none": lambda: mean,
-    #             "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
-    #         }[self._mean_act]()
-    #         std = {
-    #             "softplus": lambda: torch.nn.functional.softplus(std),
-    #             "abs": lambda: torch.abs(std + 1),
-    #             "sigmoid": lambda: torch.sigmoid(std),
-    #             "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
-    #         }[self._std_act]() + self._min_std
-    #         return {"mean": mean, "std": std}

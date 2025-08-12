@@ -179,17 +179,18 @@ if 'embed_list' in locals():
 #%% Cell 7: Test Decoder
 print("\n=== Testing Decoder ===")
 
-if 'spatial_post' in locals():
+if 'post' in locals():
     try:
-        decoder_output = world_model.heads['decoder'](spatial_post)
+        # LadderDecoder expects the per-level latents list (finest->coarsest)
+        decoder_output = world_model.heads['decoder'](post['stoch'])
         print(f"✅ Decoder forward pass successful")
         print(f"   Decoder output keys: {list(decoder_output.keys())}")
-        
+
         if 'image' in decoder_output:
-            recon = decoder_output['image'].mode()
+            recon = decoder_output['image'].mode()  # (B,T,H,W,C)
             print(f"   Reconstruction shape: {recon.shape}")
             print(f"   Reconstruction range: [{recon.min():.3f}, {recon.max():.3f}]")
-        
+
     except Exception as e:
         print(f"❌ Decoder forward pass failed: {e}")
         import traceback
@@ -223,7 +224,7 @@ try:
     print(f"✅ Dynamics successful")
     
     # Decode
-    decoder_output = world_model.heads['decoder'](spatial_post)
+    decoder_output = world_model.heads['decoder'](post['stoch'])
     print(f"✅ Full pipeline successful!")
     
 except Exception as e:
@@ -268,8 +269,10 @@ try:
     )
 
     # 4) Decode
-    dec_out = world_model.heads['decoder'](spat)
-    recon   = dec_out['image'].mode()  # (B,H,W,C)
+    dec_out = world_model.heads['decoder'](post['stoch'])
+    recon   = dec_out['image'].mode()  # (B,T,H,W,C) or (B,1,H,W,C) in this test
+    if recon.dim() == 5 and recon.shape[1] == 1:
+        recon = recon[:, 0]
 
     # 5) Compute MSE loss against inputs
     target = proc['image'].squeeze(1)  # (B,H,W,C)

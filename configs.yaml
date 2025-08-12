@@ -42,7 +42,10 @@ defaults:
   # Hierarchical VAE Configuration
   encoder_type: 'original'        # ['original', 'unet_flat', 'densenet_ladder']
   ladder_levels: 1                # Number of hierarchical levels (1 = vanilla Dreamer)
-  kl_balancing: false             # Enable per-level KL balancing with free-bits
+  kl_balancing: true              # Enable EMA per-level KL equalization
+  kl_balancer: "equal"            # ['equal','sqrt','square']
+  kl_balance_momentum: 0.05       # EMA update rate alpha
+  kl_soft_tau: 0.1                # Softplus temperature for soft free-bits
   dense_growth: 32                # DenseNet growth rate (filters added per layer)
   dense_block_layers: 4           # Number of dense layers per block
   dense_compression: 0.5          # Channel compression ratio in transitions
@@ -57,7 +60,6 @@ defaults:
   kl_beta_min: 1.0e-4              # minimum beta value
   kl_anneal_portion: 0.3         # portion of training for annealing
   kl_const_portion: 0.0          # portion of training at minimum beta
-  kl_balancer: "equal"           # KL balancing scheme: equal, linear, sqrt, square
 
   # Linear probing evaluation parameters
   linear_probe_every: 20000  # Steps between linear probing evaluations
@@ -277,7 +279,7 @@ vizdoom_health_gathering:
   imag_gradient: 'reinforce'
   time_limit: 2100
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
-  decoder: {mlp_keys: '$^', cnn_keys: 'image'}    
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
 debug:
   debug: True
@@ -329,7 +331,16 @@ hdreamer:
     discrete:      32       # categories per variable
     act: 'SiLU'
     norm: true
-    up_mode: 'bilinear' # must be 'bilinear' 
+    up_mode: 'bilinear' # must be 'bilinear'
+    kl_balancing: true
+    kl_balancer: "equal" #(or "square" if you want stronger)
+    kl_balance_momentum: 0.05 # (0.10 for faster)
+    kl_soft_tau: 0.1
+    kl_gamma_clip_min: 0.5
+    kl_gamma_clip_max: 2.0
+    kl_under_penalty: 0.05
+    expose_levels: "all"
+
 
   # ------------ encoder configuration (for hConvEncoder) ------------
   encoder:
@@ -382,3 +393,5 @@ hdreamer:
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
+  film_top_level: true
+  ladder_blocks_per_level: 2
