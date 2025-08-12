@@ -665,9 +665,11 @@ class LadderDecoder(nn.Module):
             feat = self.merge[l](feat)
             feat = self.level_blocks[l](feat)
 
-        # Produce image at finest resolution and reshape back to (B,T,C,H,W)
-        mean = self.final_conv(feat)                  # (BT, C, H0, W0)
+        # Upsample to target image resolution if needed, then produce image and reshape
         C, H, W = self.out_shape
+        if feat.shape[-2:] != (H, W):
+            feat = F.interpolate(feat, size=(H, W), mode='bilinear', align_corners=False)
+        mean = self.final_conv(feat)                  # (BT, C, H, W)
         mean = mean.reshape(B, T, C, H, W)
         mean = mean.permute(0, 1, 3, 4, 2)           # (B,T,H,W,C)
         mean = torch.sigmoid(mean) if self.cnn_sigmoid else (mean + 0.5)
@@ -897,14 +899,14 @@ class hWorldModel(WorldModel):
         )
 
         # Reconstructions for the context using ladder decoder (consume post latents)
-        recon = self.heads["decoder"](states['stoch']).mode()
+        recon = self.heads["decoder"](states['stoch'])["image"].mode()
 
         # Get the last state to start imagination from
         init_state = {k: (v[:, -1] if not isinstance(v, list) else [vi[:, -1] for vi in v]) for k, v in states.items()}
 
         # Imagine the future
         priors, _ = self.dynamics.imagine_with_action(data["action"][:, context_len:], init_state)
-        openl = self.heads["decoder"](priors['stoch']).mode()
+        openl = self.heads["decoder"](priors['stoch'])["image"].mode()
 
         # Combine context reconstructions and open-loop predictions
         model = torch.cat([recon, openl], 1)

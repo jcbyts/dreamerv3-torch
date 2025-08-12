@@ -837,7 +837,8 @@ class BlockDiagGRUCell(nn.Module):
 
         # Input + recurrent
         parts = self.Wx(x)                          # (N, 3*size)
-        parts_rec = torch.matmul(hB, self.Wrec)     # (N, K, 3b)
+        # Batched per-block matmul: (N,K,1,b) @ (1,K,b,3b) -> (N,K,1,3b) -> (N,K,3b)
+        parts_rec = torch.matmul(hB.unsqueeze(2), self.Wrec.unsqueeze(0)).squeeze(2)
         parts = parts + parts_rec.reshape(N, 3 * self.size)
 
         if self.ln is not None:
@@ -1101,7 +1102,7 @@ class hRSSM(RSSM):
         up_mode="nearest",
         **kwargs
     ):
-        super().__init__()
+        nn.Module.__init__(self)
         # ----- core config copied from RSSM ---------------------------------
         self._discrete     = kwargs.get("discrete", False)  # K categories or False
         self._unimix_ratio = kwargs.get("unimix_ratio", 0.01)
@@ -1344,7 +1345,7 @@ class hRSSM(RSSM):
             }[self._std_act]() + self._min_std
             stats = {"mean": mean, "std": std}
         dist = self.get_dist_h(stats)
-        z = dist.rsample() if (sample and hasattr(dist, 'rsample')) else (dist.sample() if sample else dist.mode())
+        z = dist.sample() if sample else dist.mode()
         prior_stoch[l] = z
         if self._discrete:
             prior_stats["logit"][l] = logit
@@ -1380,7 +1381,7 @@ class hRSSM(RSSM):
                 stats = {"mean": mean, "std": std}
 
             dist = self.get_dist_h(stats)
-            z = dist.rsample() if (sample and hasattr(dist, 'rsample')) else (dist.sample() if sample else dist.mode())
+            z = dist.sample() if sample else dist.mode()
             prior_stoch[l] = z
             if self._discrete:
                 prior_stats["logit"][l] = logit
@@ -1481,7 +1482,7 @@ class hRSSM(RSSM):
             }[self._std_act]() + self._min_std
             stats = {"mean": mean, "std": std}
         dist = self.get_dist_h(stats)
-        z = dist.rsample() if (sample and hasattr(dist, 'rsample')) else (dist.sample() if sample else dist.mode())
+        z = dist.sample() if sample else dist.mode()
         post_stoch[l] = z
         if self._discrete:
             post_stats["logit"][l] = logit
@@ -1518,7 +1519,7 @@ class hRSSM(RSSM):
                 stats = {"mean": mean, "std": std}
 
             dist = self.get_dist_h(stats)
-            z = dist.rsample() if (sample and hasattr(dist, 'rsample')) else (dist.sample() if sample else dist.mode())
+            z = dist.sample() if sample else dist.mode()
             post_stoch[l] = z
             if self._discrete:
                 post_stats["logit"][l] = logit
@@ -1750,9 +1751,9 @@ class hRSSM(RSSM):
     def get_dist_h(self, state_level):
         if self._discrete:
             logit = state_level["logit"]
-            # Use OneHotDist with temperature; ContDist wrapper supports rsample if provided
+            # Keep OneHotDist without temperature; Independent sums over categories.
             dist = torchd.independent.Independent(
-                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio, temperature=getattr(self, '_gumbel_tau', 1.0)), 1
+                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
             )
             return dist
         else:
